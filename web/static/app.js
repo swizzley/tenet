@@ -325,6 +325,64 @@ function lot(slot) {
   const [x, z] = slot.cells.at(-1), [dx, dz] = LOTS[slot.next++ % LOTS.length];
   return { x: x + dx, z: z + dz };
 }
+// The neon on a building: tubes up its four corners, a vertical blade sign with
+// the file's name on one face, and a roof sign once it stands tall. Each sign's
+// color and its flicker follow from the file's path (seeded, so a repository's
+// city always lights the same way). Signs are not pickable, so they never block
+// a click on the floors behind them.
+const BLADE_W = 0.85, GLYPH = 0.56;
+function bladeTexture(text, color) {
+  const chars = [...text.toUpperCase()].slice(0, 14);
+  const c = document.createElement('canvas');
+  c.width = 64; c.height = 56 * chars.length + 16;
+  const g = c.getContext('2d');
+  g.fillStyle = 'rgba(6, 4, 14, 0.85)';
+  g.fillRect(0, 0, c.width, c.height);
+  g.strokeStyle = color; g.lineWidth = 4; g.shadowColor = color; g.shadowBlur = 12;
+  g.strokeRect(4, 4, c.width - 8, c.height - 8);
+  g.font = '700 40px ui-monospace, Menlo, monospace';
+  g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillStyle = color;
+  chars.forEach((ch, i) => g.fillText(ch, 32, 36 + i * 56));
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return { t, n: chars.length };
+}
+function neonFor(tw, path) {
+  const h = hashStr(path), name = path.slice(path.lastIndexOf('/') + 1);
+  const hex = NEON[h % NEON.length], css = '#' + hex.toString(16).padStart(6, '0');
+  const tube = new THREE.MeshBasicMaterial({ color: hex });
+  tw.tubes = [-1, 1].flatMap((sx) => [-1, 1].map((sz) => {
+    const m = new THREE.Mesh(box, tube);
+    m.position.set(sx * 1.02, 0, sz * 1.02);
+    m.scale.set(0.06, 0.001, 0.06);
+    tw.group.add(m);
+    return m;
+  }));
+  const { t, n } = bladeTexture(name, css);
+  const blade = new THREE.Mesh(new THREE.PlaneGeometry(BLADE_W, GLYPH * n + 0.12), new THREE.MeshBasicMaterial({ map: t, transparent: true, side: THREE.DoubleSide, toneMapped: false }));
+  const face = h >>> 3 & 3; // which face carries it
+  blade.rotation.y = face * Math.PI / 2 + Math.PI / 2;
+  blade.position.set(Math.cos(face * Math.PI / 2) * 1.35, 0, -Math.sin(face * Math.PI / 2) * 1.35);
+  blade.visible = false;
+  tw.group.add(blade);
+  const roof = new THREE.Mesh(new THREE.PlaneGeometry(2.6, 0.45), new THREE.MeshBasicMaterial({ map: label(name, css, false, 512, 88, 40), transparent: true, side: THREE.DoubleSide, toneMapped: false }));
+  roof.visible = false;
+  tw.group.add(roof);
+  tw.neon = { tube, blade, bladeH: GLYPH * n + 0.12, roof, flicker: (h >>> 7) % 5 === 0, phase: (h % 1000) / 159 };
+}
+function stepNeon(tw, now) {
+  const nn = tw.neon;
+  for (const m of tw.tubes) { m.scale.y = Math.max(0.001, tw.top); m.position.y = tw.top / 2; }
+  nn.blade.visible = tw.top > nn.bladeH + 0.8;
+  if (nn.blade.visible) nn.blade.position.y = Math.min(tw.top - nn.bladeH / 2 - 0.3, nn.bladeH / 2 + 0.6 + (tw.top - nn.bladeH) * 0.4);
+  nn.roof.visible = tw.top > 7;
+  nn.roof.position.y = tw.top + 2.3;
+  // a flickering sign stutters like a failing tube; the others breathe slowly
+  const s = nn.flicker ? (Math.sin(now / 37 + nn.phase * 9) > 0.2 || Math.sin(now / 900 + nn.phase) > 0 ? 1 : 0.15) : 0.82 + 0.18 * Math.sin(now / 700 + nn.phase);
+  nn.blade.material.opacity = s;
+  nn.roof.material.opacity = s;
+  nn.roof.rotation.y = Math.atan2(camera.position.x - tw.group.position.x, camera.position.z - tw.group.position.z);
+}
 function newTower(slot, path) {
   const p = lot(slot);
   const group = new THREE.Group();
@@ -342,6 +400,7 @@ function newTower(slot, path) {
   group.add(cap);
   const tw = { path, group, cap, beacon, layers: [], top: 0, versions: 0, dropped: 0, status: '', lines: 0 };
   for (const m of [roof, beacon]) { m.userData = { tower: tw, cap: true }; pickables.push(m); }
+  neonFor(tw, path);
   slot.files.set(path, tw);
   return tw;
 }
@@ -934,6 +993,7 @@ function frame(now) {
         m.material.emissiveIntensity = 1.1 + lit + u.flash * 2 + (hover && hover.layer === m ? 1.2 : 0);
       }
       tw.cap.position.y += (tw.top + 0.11 - tw.cap.position.y) * k6;
+      stepNeon(tw, now);
       tw.beacon.scale.setScalar(pulse + (hover && hover.tower === tw && !hover.layer ? 0.5 : 0));
     }
   }
