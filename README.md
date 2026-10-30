@@ -10,7 +10,7 @@ One process runs all three: the collector, the REST API, the WebSocket stream an
 
 ## 60-second quickstart
 
-Prerequisites: Go 1.25+ and `git` (git is needed by the tests only).
+Prerequisites: Go 1.26 (any Go 1.21 or later downloads it automatically) and `git` (git is needed by the tests only).
 
 ```sh
 cd tenet

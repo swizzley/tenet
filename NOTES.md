@@ -7,7 +7,7 @@ cp config.example.json config.json    # github_token + anthropic_api_key
 go run ./cmd/tenet                    # http://127.0.0.1:8080
 ```
 
-- **Prerequisites:** Go 1.25 or later. `git` too, but only for the tests.
+- **Prerequisites:** Go 1.26: the pure-Go SQLite driver needs it, and any Go 1.21 or later downloads it automatically. `git` too, but only for the tests.
 - **Credentials:** a GitHub token with read-only access to public repositories, and an Anthropic API key. Each one may come from `config.json` or from its environment variable (`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`). The service refuses to start, naming what is missing, if either is absent.
 - **Settings:** every other setting has a default (listed in `config.example.json`). An unknown key in `config.json` is an error, so a typo fails loudly. The SQLite file (`tenet.db`) is created on first run.
 - **Why Go, not TypeScript:** the work here is concurrency: a double-buffered writer, a rate-limited fan-out of requests, and a stream to many viewers. Go does that in one process, with one binary, a race detector, and a pure-Go SQLite (no cgo, no native build step for the reviewer).
