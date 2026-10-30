@@ -14,9 +14,15 @@ function repoPath() {
   return `${encodeURIComponent(m[1])}/${encodeURIComponent(m[2])}`;
 }
 
+// periodQuery is the period to explain: since/until from the page's URL when
+// given, else the selected number of days up to now.
 function periodQuery() {
   const q = new URLSearchParams(location.search), out = new URLSearchParams();
   for (const k of ['since', 'until']) if (q.get(k)) out.set(k, q.get(k));
+  if (!out.has('since')) {
+    const since = new Date(Date.now() - Number($('period').value) * 864e5);
+    out.set('since', since.toISOString().slice(0, 10));
+  }
   return out.toString();
 }
 

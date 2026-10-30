@@ -388,6 +388,24 @@ func TestBrowserNarrativeIsCheckedAgainstServerData(t *testing.T) {
 	}
 }
 
+// A period with 0 commits is refused before any model sees it: an empty document
+// only gets its emptiness narrated (seen live). Both narrative paths say so.
+func TestNarrativeRefusesAnEmptyPeriod(t *testing.T) {
+	e := newEnv(t)
+	empty := "since=2025-06-01&until=2025-06-30" // before the test history begins
+	var body struct {
+		Error apiError `json:"error"`
+	}
+	for _, path := range []string{"/insights/narrative/prompt?", "/insights/narrative?"} {
+		if r := e.get("/api/v1/repos/o/r"+path+empty, &body); r.StatusCode != 422 || body.Error.Code != "no_commits" || !strings.Contains(body.Error.Message, "2025-06-01") {
+			t.Fatalf("%s: %d %+v", path, r.StatusCode, body.Error)
+		}
+	}
+	if e.llm.calls != 0 {
+		t.Fatal("the model was asked about an empty period")
+	}
+}
+
 // Without an Anthropic key the server narrative answers 501 and points to the page.
 func TestServerNarrativeOffWithoutKey(t *testing.T) {
 	e := newEnv(t)

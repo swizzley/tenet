@@ -76,6 +76,8 @@ body.filing .hud-left { display: none; }
 .card dl { font-size: 13px; }
 .card .fine { margin: 14px 0 0; font-size: 11px; color: var(--dim); }
 
+#period { border: 0; border-left: 1px solid var(--line); background: transparent; color: var(--dim); font: 12px var(--mono); padding: 0 6px; cursor: pointer; }
+#period option { background: #0b0d16; color: var(--ink); }
 #explain { padding: 0 18px; border: 0; border-left: 1px solid var(--line); background: transparent; color: var(--dim); font: 600 13px var(--mono); letter-spacing: .25em; text-transform: uppercase; cursor: pointer; }
 #explain:hover { color: var(--ink); background: rgba(61, 139, 255, .18); }
 #explain:disabled { opacity: .45; cursor: wait; }

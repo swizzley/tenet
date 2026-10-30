@@ -128,6 +128,10 @@ var ErrNoServerNarrator = errors.New("no anthropic_api_key is configured; the pa
 // ErrDataChanged: the period's data changed between the prompt and the check.
 var ErrDataChanged = errors.New("the period's data changed since the prompt was built")
 
+// ErrNoCommits: the period holds no commits on the default branch, so there is
+// nothing to narrate.
+var ErrNoCommits = errors.New("the period holds no commits")
+
 func (s *Service) Narrative(ctx context.Context, p Period) (NarrativeResponse, error) {
 	if s.Narrator == nil {
 		return NarrativeResponse{}, ErrNoServerNarrator
@@ -190,6 +194,11 @@ func (s *Service) payload(ctx context.Context, p Period, browser bool) (map[stri
 	d, err := s.Load(ctx, p)
 	if err != nil {
 		return nil, "", err
+	}
+	if len(d.Records) == 0 {
+		// Nothing to explain: a model handed an empty document narrates the
+		// emptiness (seen live: tensorwire/mongoose over a quiet 30 days).
+		return nil, "", ErrNoCommits
 	}
 	in := insight.Compute(p.Repo(), d.Records, p.Since, p.Until, "commits", d.Truncated)
 	if browser {

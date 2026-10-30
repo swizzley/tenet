@@ -87,6 +87,10 @@ func (s *Server) upstream(w http.ResponseWriter, r *http.Request, err error) {
 	var se *github.StatusError
 	var ue *narrate.UnsupportedError
 	switch {
+	case errors.Is(err, ErrNoCommits):
+		p, _ := s.period(r)
+		fail(w, 422, "no_commits", fmt.Sprintf("%s: 0 commits on its default branch from %s to %s, so there is nothing to explain; choose a longer period",
+			p.Repo(), p.Since.Format(time.DateOnly), p.Until.Format(time.DateOnly)), nil)
 	case errors.Is(err, ErrNoServerNarrator):
 		fail(w, 501, "narrative_in_browser", "no anthropic_api_key is configured, so the server writes no narrative. "+
 			"The page writes it in the browser: GET .../insights/narrative/prompt gives the model's input, "+
