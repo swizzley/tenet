@@ -1,0 +1,14 @@
+{
+  "github_token": "",
+  "anthropic_api_key": "",
+
+  "addr": "127.0.0.1:8080",
+  "db_path": "tenet.db",
+  "anthropic_model": "claude-opus-5-5",
+  "buffer_cap": 100,
+  "max_reconstruct": 300,
+  "max_period_days": 366,
+  "max_period_commits": 20000,
+  "cache_ttl_seconds": 600,
+  "max_sessions": 4
+}

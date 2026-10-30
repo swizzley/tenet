@@ -1,0 +1,6 @@
+# credentials and local state never enter the repository
+config.json
+*.db
+*.db-shm
+*.db-wal
+/bin/

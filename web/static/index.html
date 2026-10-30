@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tenet · repository inversion</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+</head>
+<body>
+<canvas id="scene" aria-hidden="true"></canvas>
+<div id="flash" aria-hidden="true"></div>
+
+<header class="hud-top">
+  <div class="sator" aria-hidden="true"><span>S A T O R</span><span>A R E P O</span><span class="mid">T E N E T</span><span>O P E R A</span><span>R O T A S</span></div>
+  <form id="query" autocomplete="off">
+    <label for="repo" class="sr">Repository</label>
+    <input id="repo" name="repo" placeholder="owner/name  ·  e.g. rsc/quote" spellcheck="false" required
+           pattern="\s*(https://github\.com/)?[A-Za-z0-9][A-Za-z0-9\-]{0,38}/[A-Za-z0-9._\-]{1,100}\s*">
+    <button id="go" type="submit">Invert</button>
+  </form>
+  <p id="msg" role="status" aria-live="polite"></p>
+</header>
+
+<aside class="hud-left" id="stats" hidden>
+  <div class="phase" id="phase">—</div>
+  <div class="clock" id="clock">00:00</div>
+  <dl>
+    <dt>commits</dt><dd id="s-commits">0</dd>
+    <dt>file versions</dt><dd id="s-files">0</dd>
+    <dt>proven exact</dt><dd id="s-exact" class="blue">0</dd>
+    <dt>unproven</dt><dd id="s-unknown" class="amber">0</dd>
+    <dt>mismatch</dt><dd id="s-mismatch" class="red">0</dd>
+  </dl>
+  <div class="legend"><i class="blue"></i>exact <i class="amber"></i>unproven <i class="red"></i>mismatch</div>
+</aside>
+
+<aside class="hud-right" id="ticker" aria-label="events"></aside>
+
+<section class="card" id="summary" hidden>
+  <h2 id="sum-title">Reconstruction</h2>
+  <p id="sum-line"></p>
+  <dl id="sum-grid"></dl>
+  <p class="fine" id="sum-fine"></p>
+</section>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
