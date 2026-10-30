@@ -1,5 +1,7 @@
 # tenet
 
+*The best worst way to do git archaeology.* It rebuilds a repository from nothing but its diffs, runs time backward down a neon avenue to the first commit, then grows the code forward as a night city you can walk through. Completely pointless, which probably makes it art.
+
 A Go service that reads a GitHub repository's commit history and does three things with it:
 
 1. **Insight.** It ranks the top contributors over a period, by commits and by lines changed.
