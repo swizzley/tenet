@@ -150,10 +150,12 @@ function label(text, color, mirrored, w = 512, h = 72, size = 30) {
   t.colorSpace = THREE.SRGBColorSpace;
   return t;
 }
+// dispose frees an object's materials and textures, except materials many
+// objects share (marked userData.shared), which stay for the others.
 function dispose(o, parent) {
   parent.remove(o);
   o.traverse((x) => {
-    if (x.material) { if (x.material.map) x.material.map.dispose(); x.material.dispose(); }
+    if (x.material && !x.material.userData.shared) { if (x.material.map) x.material.map.dispose(); x.material.dispose(); }
   });
 }
 
@@ -186,6 +188,7 @@ scene.add(avenue);
 const arches = new THREE.Group();
 avenue.add(arches);
 const archMat = new THREE.MeshBasicMaterial({ color: RED });
+archMat.userData.shared = true;
 let depth = 0;
 const SPACING = 5;
 function invertCommit(e) {
@@ -271,11 +274,16 @@ const CELLS = (() => {
   }
   return out;
 })();
-const LOTS = (() => {
-  const out = [];
-  for (let i = -2; i <= 2; i++) for (let j = -2; j <= 2; j++) out.push([i * 2.5, j * 2.5]);
-  return out.sort((a, b) => Math.hypot(...a) - Math.hypot(...b));
-})();
+// A block's 25 lots: 16 on its street frontage, 8 behind them, 1 in the middle.
+const LOTS = [];
+for (let i = -2; i <= 2; i++) for (let j = -2; j <= 2; j++) LOTS.push({ dx: i * 2.5, dz: j * 2.5, ring: Math.max(Math.abs(i), Math.abs(j)) });
+// lotOrder is the order a block at (x, z) fills in: the street frontage first,
+// and along it the lots nearest the city's center first, so a sparse directory
+// lines the street on the side toward the center square instead of standing in
+// the middle of an empty block.
+function lotOrder(x, z) {
+  return [...LOTS].sort((a, b) => (b.ring - a.ring) || (Math.hypot(x + a.dx, z + a.dz) - Math.hypot(x + b.dx, z + b.dz)));
+}
 const streets = new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints((() => {
   const pts = [], L = 14 * BLOCK + BLOCK / 2;
   for (let i = -14; i <= 15; i++) {
@@ -287,6 +295,7 @@ const streets = new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(
 city.add(streets);
 const plateMat = new THREE.MeshStandardMaterial({ color: 0x0d0e18, roughness: 0.6, metalness: 0.3 });
 const shaftMat = new THREE.MeshStandardMaterial({ color: 0x1a1c26, roughness: 0.5, metalness: 0.6 });
+plateMat.userData.shared = shaftMat.userData.shared = true;
 
 const dirs = new Map(); // dir -> {cells: [[x, z]], next, files: Map(path -> tower), hue}
 let nextCell = 0;
@@ -297,32 +306,58 @@ let commitNow = null;   // the commit being replayed, for its floor bands
 let extent = 10;        // how far the city reaches, for the camera
 function dirOf(path) { const i = path.lastIndexOf('/'); return i < 0 ? '/' : path.slice(0, i); }
 function dirSlot(d) {
-  if (!dirs.has(d)) dirs.set(d, { cells: [], next: 0, files: new Map(), hue: NEON[hashStr(d) % NEON.length], name: d });
+  if (!dirs.has(d)) dirs.set(d, { cells: [], blocks: [], next: 0, files: new Map(), hue: NEON[hashStr(d) % NEON.length], name: d });
   return dirs.get(d);
 }
+// freeCells are blocks given back by directories that lost their last file.
+// A new block takes the free one nearest the center square before it claims new
+// land at the edge, so the city stays packed around its center.
+let freeCells = [];
+function takeCell() {
+  const next = CELLS[Math.min(nextCell, CELLS.length - 1)];
+  freeCells.sort((a, b) => Math.hypot(...a) - Math.hypot(...b));
+  if (freeCells.length && Math.hypot(...freeCells[0]) <= Math.hypot(...next)) return freeCells.shift();
+  nextCell++;
+  return next;
+}
 function newBlock(slot) {
-  const [i, j] = CELLS[Math.min(nextCell++, CELLS.length - 1)];
+  const [i, j] = takeCell();
   const x = i * BLOCK, z = j * BLOCK;
   const plate = new THREE.Mesh(box, plateMat);
   plate.scale.set(BLOCK - 1, 0.18, BLOCK - 1);
   plate.position.set(x, 0.09, z);
-  city.add(plate);
   const h = (BLOCK - 1) / 2;
   const edge = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints([[-h, -h], [h, -h], [h, h], [-h, h]].map(([a, b]) => new THREE.Vector3(x + a, 0.2, z + b))),
     new THREE.LineBasicMaterial({ color: slot.hue }));
-  city.add(edge);
+  const parts = [plate, edge];
   if (!slot.cells.length) {
     const sign = new THREE.Sprite(new THREE.SpriteMaterial({ map: label(slot.name, '#' + slot.hue.toString(16).padStart(6, '0'), false, 512, 64, 26), transparent: true, depthWrite: false }));
     sign.scale.set(6.5, 0.8, 1);
     sign.position.set(x, 0.9, z + h + 0.6);
-    city.add(sign);
+    parts.push(sign);
   }
+  city.add(...parts);
+  slot.blocks.push({ cell: [i, j], parts });
   slot.cells.push([x, z]);
   extent = Math.max(extent, Math.hypot(x, z) + BLOCK);
 }
+// clearBlocks gives an emptied directory's land back to the city.
+function clearBlocks(slot) {
+  for (const b of slot.blocks) {
+    for (const p of b.parts) {
+      city.remove(p);
+      if (!p.material.userData.shared) { if (p.material.map) p.material.map.dispose(); p.material.dispose(); }
+    }
+    freeCells.push(b.cell);
+  }
+  dirs.delete(slot.name);
+}
 function lot(slot) {
   if (slot.next % LOTS.length === 0) newBlock(slot);
-  const [x, z] = slot.cells.at(-1), [dx, dz] = LOTS[slot.next++ % LOTS.length];
+  const [x, z] = slot.cells.at(-1);
+  slot.order ??= [];
+  if (slot.order.length !== slot.cells.length) slot.order.push(lotOrder(x, z));
+  const { dx, dz } = slot.order.at(-1)[slot.next++ % LOTS.length];
   return { x: x + dx, z: z + dz };
 }
 // The neon on a building: tubes up its four corners, a vertical blade sign with
@@ -467,6 +502,7 @@ function removeFile(path, burst) {
   }
   tw.group.traverse((m) => { const i = pickables.indexOf(m); if (i >= 0) pickables.splice(i, 1); });
   dispose(tw.group, city);
+  if (!slot.files.size) clearBlocks(slot);
 }
 
 // Billboards: a commit's headline flashes on a tall building's face.
@@ -794,7 +830,7 @@ function reset(repo) {
   city.add(streets);
   for (const s of [...sheets]) retire(s);
   dirs.clear(); shards.length = 0; pickables.length = 0; billboards.length = 0;
-  queue = []; received = 0; depth = 0; clock = 0; extent = 10; nextCell = 0;
+  queue = []; received = 0; depth = 0; clock = 0; extent = 10; nextCell = 0; freeCells = [];
   commitNow = null; runDone = false; hover = null; tip.hidden = true; closeFile();
   rand = mulberry32(hashStr(repo));
   noise = createNoise2D(mulberry32(hashStr(repo) ^ 0x9e3779b9));
