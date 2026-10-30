@@ -50,6 +50,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/repos/{owner}/{repo}/insights/narrative/verify", s.verifyNarrative)
 	mux.HandleFunc("POST /api/v1/reconstructions", s.startReconstruction)
 	mux.HandleFunc("GET /api/v1/reconstructions/{id}", s.reconstructionStatus)
+	mux.HandleFunc("DELETE /api/v1/reconstructions/{id}", s.cancelReconstruction)
 	mux.HandleFunc("GET /api/v1/reconstructions/{id}/events", s.reconstructionEvents)
 	mux.HandleFunc("GET /api/v1/reconstructions/{id}/file", s.reconstructionFile)
 	mux.HandleFunc("GET /api/v1/reconstructions/{id}/diff", s.reconstructionDiff)
@@ -89,8 +90,15 @@ func (s *Server) upstream(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, ErrNoCommits):
 		p, _ := s.period(r)
-		fail(w, 422, "no_commits", fmt.Sprintf("%s: 0 commits on its default branch from %s to %s, so there is nothing to explain; choose a longer period",
-			p.Repo(), p.Since.Format(time.DateOnly), p.Until.Format(time.DateOnly)), nil)
+		msg := fmt.Sprintf("%s: 0 commits on its default branch from %s to %s", p.Repo(), p.Since.Format(time.DateOnly), p.Until.Format(time.DateOnly))
+		// A quiet repository's last commit can be years back, past any period
+		// that ends now: name it, so the caller can ask for the period ending there.
+		if last, ok := s.lastCommit(r.Context(), p); ok {
+			fail(w, 422, "no_commits", msg+fmt.Sprintf("; its last commit before then is from %s, so choose a period that ends there", last.Format(time.DateOnly)),
+				map[string]string{"latest": last.Format(time.RFC3339)})
+			return
+		}
+		fail(w, 422, "no_commits", msg+", so there is nothing to explain; choose a longer period", nil)
 	case errors.Is(err, ErrNoServerNarrator):
 		fail(w, 501, "narrative_in_browser", "no anthropic_api_key is configured, so the server writes no narrative. "+
 			"The page writes it in the browser: GET .../insights/narrative/prompt gives the model's input, "+
@@ -277,12 +285,21 @@ func (s *Server) startReconstruction(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Repo       string `json:"repo"`
 		MaxCommits int    `json:"max_commits"`
+		Since      string `json:"since"`
 	}
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
-		fail(w, 400, "bad_request", `body must be JSON like {"repo":"owner/name","max_commits":200}`, nil)
+		fail(w, 400, "bad_request", `body must be JSON like {"repo":"owner/name","max_commits":200,"since":"2026-08-01"}`, nil)
 		return
+	}
+	var since time.Time
+	if req.Since != "" {
+		var err error
+		if since, err = parseTime(req.Since, false); err != nil || since.After(time.Now()) {
+			fail(w, 400, "bad_request", "since must be a past date or RFC 3339 time", nil)
+			return
+		}
 	}
 	owner, name, err := github.ParseRepo(req.Repo)
 	if err != nil {
@@ -296,7 +313,7 @@ func (s *Server) startReconstruction(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "bad_request", fmt.Sprintf("max_commits must be 1 to %d", s.MaxReconstruct), nil)
 		return
 	}
-	sess, err := s.Recon.Start(owner, name, req.MaxCommits)
+	sess, err := s.Recon.Start(owner, name, reconstruct.Window{Max: req.MaxCommits, Since: since})
 	if errors.Is(err, reconstruct.ErrBusy) {
 		w.Header().Set("Retry-After", "10")
 		fail(w, 429, "busy", err.Error(), nil)
@@ -314,6 +331,31 @@ func (s *Server) reconstructionStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, sess.Status())
+}
+
+// lastCommit is the date of the default branch's newest commit before the
+// period ends: one call to the commit list.
+func (s *Server) lastCommit(ctx context.Context, p Period) (time.Time, bool) {
+	if s.Recon == nil || s.Recon.Runner == nil {
+		return time.Time{}, false
+	}
+	cs, _, err := s.Recon.Runner.GH.ListCommits(ctx, p.Owner, p.Name, github.ListOptions{Until: p.Until, Page: 1, PerPage: 1})
+	if err != nil || len(cs) == 0 || cs[0].Commit.Author.Date.IsZero() {
+		return time.Time{}, false
+	}
+	return cs[0].Commit.Author.Date.UTC(), true
+}
+
+// cancelReconstruction stops a run, so an abandoned one stops spending the
+// GitHub budget. The session stays readable as failed.
+func (s *Server) cancelReconstruction(w http.ResponseWriter, r *http.Request) {
+	sess, ok := s.Recon.Get(r.PathValue("id"))
+	if !ok {
+		fail(w, 404, "not_found", "unknown reconstruction id", nil)
+		return
+	}
+	sess.Cancel()
+	w.WriteHeader(204)
 }
 
 // reconstructionEvents streams a session over a WebSocket: everything so far, then

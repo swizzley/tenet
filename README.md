@@ -35,7 +35,7 @@ open http://127.0.0.1:8080/?repo=spf13/pflag          # the reconstruction, anim
 
 curl 'http://127.0.0.1:8080/api/v1/repos/golang/go/insights/contributors?since=2026-10-01&until=2026-10-28&limit=5'
 curl 'http://127.0.0.1:8080/api/v1/repos/golang/go/insights/narrative/prompt?since=2026-10-01&until=2026-10-28'
-curl -X POST http://127.0.0.1:8080/api/v1/reconstructions -d '{"repo":"rsc/quote"}'
+curl -X POST http://127.0.0.1:8080/api/v1/reconstructions -d '{"repo":"rsc/quote","since":"2026-08-01"}'
 ```
 
 The service will not start without a GitHub token. It says where to put it:
@@ -71,7 +71,7 @@ Every error body has the same shape: `{"error":{"code":"...","message":"..."}}`.
   - `400`: bad input;
   - `404`: the repository is unknown or private;
   - `409`: the period's data changed between the prompt and the check, or a file was asked for while its run is going;
-  - `422`: the repository is empty, the model declined, or a browser answer failed the check;
+  - `422`: the period holds no commits (`no_commits`; `details.latest` is the last commit's date when it is earlier, and the page then explains the same span ending there), the model declined, or a browser answer failed the check;
   - `501`: the server narrative is off (no `anthropic_api_key`);
   - `429`: too many reconstructions are running;
   - `502`: an upstream failure, including a narrative whose evidence failed the check;

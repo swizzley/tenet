@@ -197,19 +197,31 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		page, _ := strconv.Atoi(req.URL.Query().Get("page"))
 		page = max(page, 1)
 		per, _ := strconv.Atoi(req.URL.Query().Get("per_page"))
-		lines := strings.Split(strings.TrimSpace(g("rev-list", "--date-order", "--parents", req.URL.Query().Get("sha"))), "\n")
+		args := []string{"log", "--date-order", "--format=%H,%aI,%P"}
+		for _, k := range []string{"since", "until"} {
+			if v := req.URL.Query().Get(k); v != "" {
+				args = append(args, "--"+k+"="+v)
+			}
+		}
+		head := req.URL.Query().Get("sha")
+		if head == "" {
+			head = "main" // GitHub lists the default branch
+		}
+		lines := strings.Fields(strings.ReplaceAll(g(append(args, head)...), " ", ",")) // one "id,date,parents…" a commit
 		from, to := (page-1)*per, min(page*per, len(lines))
 		if to < len(lines) {
 			w.Header().Set("Link", `<x>; rel="next"`)
 		}
 		var out []map[string]any
 		for _, l := range lines[min(from, len(lines)):to] {
-			f := strings.Fields(l)
+			f := strings.Split(l, ",")
 			ps := []map[string]string{}
-			for _, p := range f[1:] {
-				ps = append(ps, map[string]string{"sha": p})
+			for _, p := range f[2:] {
+				if p != "" { // a root's parent list is empty
+					ps = append(ps, map[string]string{"sha": p})
+				}
 			}
-			out = append(out, map[string]any{"sha": f[0], "parents": ps})
+			out = append(out, map[string]any{"sha": f[0], "parents": ps, "commit": map[string]any{"author": map[string]string{"date": f[1]}}})
 		}
 		json.NewEncoder(w).Encode(out)
 	case strings.HasPrefix(p, "/commits/"):

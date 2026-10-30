@@ -69,7 +69,7 @@ The Claude path is the same check without the template: with a key, `GET .../nar
 
 **Reconstruction.** A reconstruction is a pincer:
 
-1. **The walker** goes back from the branch head along first parents. The commit list gives 100 commits and their parents per request, so finding the chain is cheap.
+1. **The walker** goes back from the branch head along first parents. The commit list gives 100 commits and their parents per request. The list holds every ancestor, merged branches included, so the walk asks it only back to the period's start (`since`). Unbounded, nvidia/nova's merge-heavy history ran past the hourly budget, and runs sat at one event for minutes. A run also stops at 1,500 GitHub calls, and `DELETE` cancels one. The summary's `edge` says where a run stopped: `period`, `max commits` or `call budget`. When a quiet repository's period holds 0 commits (rsc/quote: last commit 2018-07-10), the walk takes the same span back from its last commit.
 2. **Fetching diffs.** The walker fetches each commit's diff in chunks: as many requests at once as fill one buffer, capped by the rate-limit budget the limiter reads from `X-RateLimit-*` (`Limiter.Chunk`). Diffs come from SQLite when they are already stored. A commit id never changes, so a stored diff never goes stale.
 3. **The stream.** The walker publishes the diffs newest-first on a channel, the way a WebSocket would deliver real-time diffs. The replayer reads that inverted stream to its end (the turnstile), then plays it forward from an empty tree.
 4. **Applying patches.** `internal/patch` applies every patch strictly. Every resulting file must hash to the blob id GitHub reports for it at that commit, and the final tree is checked against the head tree.
@@ -178,6 +178,8 @@ The browser narrative's own live defects are listed with its measurements below.
   | rsc/quote | 17 | 10 of 10 |
   | google/uuid | 109 | 33 of 33 |
   | spf13/pflag | 233 | 91 of 91 |
+
+  With the period window (2026-10-30, 90 days): nvidia/nova walked 136 first-parent commits in 236 s, stopped at the `period` edge, made 501 GitHub calls, with 0 mismatches. rsc/quote shifted to the 90 days before its last commit: 6 commits, 5 calls, 1.3 s.
 
   A repeat google/uuid run made 5 GitHub calls instead of 114. spf13/pflag ran to its root past the old 200-commit limit: 233 commits, 589 file versions, all exact.
 

@@ -19,8 +19,10 @@ type Session struct {
 	ID      string    `json:"id"`
 	Repo    string    `json:"repo"`
 	Max     int       `json:"max_commits"`
+	From    time.Time `json:"since,omitzero"` // the window's start; zero means the root
 	Created time.Time `json:"created"`
 
+	cancel  context.CancelFunc
 	mu      sync.Mutex
 	events  []Event
 	done    bool
@@ -70,11 +72,16 @@ func (s *Session) Since(from int) ([]Event, bool, <-chan struct{}) {
 	return s.events[from:len(s.events):len(s.events)], s.done, s.changed
 }
 
+// Cancel stops the run; it ends as failed with "context canceled". A finished
+// session is unchanged.
+func (s *Session) Cancel() { s.cancel() }
+
 // Status is the session's state for the REST status endpoint.
 type Status struct {
 	ID      string    `json:"id"`
 	Repo    string    `json:"repo"`
 	Max     int       `json:"max_commits"`
+	Since   time.Time `json:"since,omitzero"`
 	Created time.Time `json:"created"`
 	State   string    `json:"state"` // running | done | failed
 	Events  int       `json:"events"`
@@ -85,7 +92,7 @@ type Status struct {
 func (s *Session) Status() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st := Status{ID: s.ID, Repo: s.Repo, Max: s.Max, Created: s.Created, Events: len(s.events), Summary: s.summary, Error: s.err, State: "running"}
+	st := Status{ID: s.ID, Repo: s.Repo, Max: s.Max, Since: s.From, Created: s.Created, Events: len(s.events), Summary: s.summary, Error: s.err, State: "running"}
 	if s.done {
 		st.State = "done"
 		if s.err != "" {
@@ -109,7 +116,7 @@ type Manager struct {
 }
 
 // Start launches a reconstruction and returns at once.
-func (m *Manager) Start(owner, name string, maxCommits int) (*Session, error) {
+func (m *Manager) Start(owner, name string, w Window) (*Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.sessions == nil {
@@ -125,13 +132,13 @@ func (m *Manager) Start(owner, name string, maxCommits int) (*Session, error) {
 	}
 	b := make([]byte, 16)
 	rand.Read(b)
-	s := &Session{ID: hex.EncodeToString(b), Repo: owner + "/" + name, Max: maxCommits, Created: time.Now().UTC(), changed: make(chan struct{})}
+	ctx, cancel := context.WithTimeout(context.Background(), m.Timeout)
+	s := &Session{ID: hex.EncodeToString(b), Repo: owner + "/" + name, Max: w.Max, From: w.Since, Created: time.Now().UTC(), cancel: cancel, changed: make(chan struct{})}
 	m.sessions[s.ID] = s
 	m.live++
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), m.Timeout)
 		defer cancel()
-		sum, files, err := m.Runner.RunFiles(ctx, owner, name, maxCommits, s.emit)
+		sum, files, err := m.Runner.RunFiles(ctx, owner, name, w, s.emit)
 		s.finish(sum, files, err)
 		if m.Log != nil {
 			m.Log.Info("reconstruction finished", "id", s.ID, "repo", s.Repo, "err", err)

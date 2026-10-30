@@ -161,10 +161,23 @@ async function explain() {
   bar(0);
   try {
     const base = `/api/v1/repos/${repoPath()}/insights/narrative`;
-    const q = periodQuery();
+    let q = periodQuery(), shifted = false;
     status('reading the period\'s commits');
     for (let fresh = 0; fresh < 2; fresh++) {
       const { r, body: p } = await api(`${base}/prompt${q ? '?' + q : ''}`);
+      // A quiet repository: its last commit is before the period. Explain the
+      // same span ending there, once, and say so.
+      const latest = p.error && p.error.code === 'no_commits' && p.error.details && p.error.details.latest;
+      if (latest && !shifted) {
+        // Whole days, from the start of the first day to the end of the last.
+        const days = Math.round((Date.now() - Date.parse(new URLSearchParams(q).get('since'))) / 864e5);
+        const end = new Date(Date.parse(latest));
+        q = new URLSearchParams({ since: new Date(end - (days - 1) * 864e5).toISOString().slice(0, 10), until: end.toISOString().slice(0, 10) }).toString();
+        shifted = true;
+        status(`no commits in the period; its last commit is from ${end.toISOString().slice(0, 10)}, so reading the same span ending there`);
+        fresh--;
+        continue;
+      }
       if (!r.ok) throw new Error(p.error ? p.error.message : r.statusText);
       $('n-model').textContent = `${p.model.id.split('/').pop().replace(/-ONNX$/, '')} · on this GPU`;
       $('n-data').textContent = `${p.data.total_commits} commits by ${p.data.contributors_total} contributors · ${p.data.since.slice(0, 10)} to ${p.data.until.slice(0, 10)}`;

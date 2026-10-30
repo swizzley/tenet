@@ -404,6 +404,24 @@ func TestNarrativeRefusesAnEmptyPeriod(t *testing.T) {
 	if e.llm.calls != 0 {
 		t.Fatal("the model was asked about an empty period")
 	}
+	// After the history ends, the answer names the last commit, so the page can
+	// ask for the period ending there (seen live: rsc/quote, quiet for years).
+	var quiet struct {
+		Error struct {
+			Code    string            `json:"code"`
+			Message string            `json:"message"`
+			Details map[string]string `json:"details"`
+		} `json:"error"`
+	}
+	last := strings.TrimSpace(e.repo.Git("log", "-1", "--format=%aI", "main"))
+	if r := e.get("/api/v1/repos/o/r/insights/narrative/prompt?since=2026-02-01&until=2026-02-27", &quiet); r.StatusCode != 422 ||
+		quiet.Error.Code != "no_commits" || quiet.Error.Details["latest"] == "" || !strings.Contains(quiet.Error.Message, last[:10]) {
+		t.Fatalf("%d %+v; want the last commit, %s", r.StatusCode, quiet.Error, last)
+	}
+	lt, _ := time.Parse(time.RFC3339, quiet.Error.Details["latest"])
+	if lt0, _ := time.Parse(time.RFC3339, last); !lt.Equal(lt0) {
+		t.Fatalf("latest %s, want %s", lt, lt0)
+	}
 }
 
 // Without an Anthropic key the server narrative answers 501 and points to the page.

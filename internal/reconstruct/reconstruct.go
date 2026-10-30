@@ -64,28 +64,30 @@ type Event struct {
 	Fetched bool     `json:"fetched,omitempty"` // file: GitHub sent no patch; the blob was fetched by id
 	Commits int      `json:"commits,omitempty"`
 	Root    bool     `json:"root,omitempty"`
+	Edge    string   `json:"edge,omitempty"` // turnstile: why the walk stopped short of the root
 	Summary *Summary `json:"summary,omitempty"`
 	Msg     string   `json:"msg,omitempty"`
 }
 
 // Summary is the proof at the end of a run.
 type Summary struct {
-	Commits      int   `json:"commits"`
-	RootReached  bool  `json:"root_reached"`
-	FileVersions int   `json:"file_versions"` // file states built, one per file per commit
-	Exact        int   `json:"exact"`         // ...whose blob id matched GitHub's
-	Unknown      int   `json:"unknown"`
-	Mismatch     int   `json:"mismatch"`
-	Fetched      int   `json:"fetched"`        // exact versions whose blob was fetched, GitHub having sent no patch
-	HeadFiles    int   `json:"head_files"`     // files in the head tree
-	HeadExact    int   `json:"head_exact"`     // ...rebuilt byte-exact
-	HeadUnknown  int   `json:"head_unknown"`   // ...present but unproven
-	HeadMissing  int   `json:"head_missing"`   // ...never produced
-	Extra        int   `json:"extra"`          // files rebuilt that the head tree lacks
-	TreeTrunc    bool  `json:"tree_truncated"` // GitHub truncated the head tree listing
-	Millis       int64 `json:"millis"`
-	APICalls     int   `json:"api_calls"`
-	CacheHits    int   `json:"cache_hits"`
+	Commits      int    `json:"commits"`
+	RootReached  bool   `json:"root_reached"`
+	Edge         string `json:"edge,omitempty"` // why the walk stopped short of the root
+	FileVersions int    `json:"file_versions"`  // file states built, one per file per commit
+	Exact        int    `json:"exact"`          // ...whose blob id matched GitHub's
+	Unknown      int    `json:"unknown"`
+	Mismatch     int    `json:"mismatch"`
+	Fetched      int    `json:"fetched"`        // exact versions whose blob was fetched, GitHub having sent no patch
+	HeadFiles    int    `json:"head_files"`     // files in the head tree
+	HeadExact    int    `json:"head_exact"`     // ...rebuilt byte-exact
+	HeadUnknown  int    `json:"head_unknown"`   // ...present but unproven
+	HeadMissing  int    `json:"head_missing"`   // ...never produced
+	Extra        int    `json:"extra"`          // files rebuilt that the head tree lacks
+	TreeTrunc    bool   `json:"tree_truncated"` // GitHub truncated the head tree listing
+	Millis       int64  `json:"millis"`
+	APICalls     int    `json:"api_calls"`
+	CacheHits    int    `json:"cache_hits"`
 }
 
 // GitHub is the part of the client the walker uses.
@@ -111,11 +113,26 @@ type Runner struct {
 	Chunk     func(bufferCap int) int // rate-limit-aware chunk size
 	BufferCap int
 	MaxBytes  int // memory cap for rebuilt content, default 256 MiB
+	MaxCalls  int // GitHub calls one run may spend, default 1,500
 }
+
+// Window bounds a run: at most Max commits, and none older than Since (zero:
+// back to the root).
+type Window struct {
+	Max   int
+	Since time.Time
+}
+
+// The reasons a walk stops short of the root (Summary.Edge).
+const (
+	EdgePeriod     = "period"
+	EdgeMaxCommits = "max commits"
+	EdgeBudget     = "call budget"
+)
 
 // Run reconstructs owner/name, walking at most max commits, and emits events.
 func (r *Runner) Run(ctx context.Context, owner, name string, max int, emit func(Event)) (*Summary, error) {
-	sum, _, err := r.RunFiles(ctx, owner, name, max, emit)
+	sum, _, err := r.RunFiles(ctx, owner, name, Window{Max: max}, emit)
 	return sum, err
 }
 
@@ -128,7 +145,7 @@ type File struct {
 }
 
 // RunFiles is Run, and also returns the rebuilt files, so a viewer can open one.
-func (r *Runner) RunFiles(ctx context.Context, owner, name string, max int, emit func(Event)) (*Summary, map[string]File, error) {
+func (r *Runner) RunFiles(ctx context.Context, owner, name string, w Window, emit func(Event)) (*Summary, map[string]File, error) {
 	start := time.Now()
 	stream := make(chan github.Commit, 64)
 	sum := &Summary{}
@@ -139,7 +156,7 @@ func (r *Runner) RunFiles(ctx context.Context, owner, name string, max int, emit
 	go func() {
 		defer wg.Done()
 		defer close(stream)
-		head, walkErr = r.walk(ctx, owner, name, max, stream, sum, emit)
+		head, walkErr = r.walk(ctx, owner, name, w, stream, sum, emit)
 	}()
 	// Blob fetches are counted apart: the walker goroutine writes sum's counters.
 	var blobCalls, blobHits int
@@ -177,7 +194,11 @@ func (r *Runner) RunFiles(ctx context.Context, owner, name string, max int, emit
 // walk finds the first-parent chain from the head, fetches the commits' diffs in
 // rate-limit-sized chunks (from the cache when it can), and publishes them on the
 // stream newest first.
-func (r *Runner) walk(ctx context.Context, owner, name string, max int, stream chan<- github.Commit, sum *Summary, emit func(Event)) (string, error) {
+func (r *Runner) walk(ctx context.Context, owner, name string, w Window, stream chan<- github.Commit, sum *Summary, emit func(Event)) (string, error) {
+	budget := r.MaxCalls
+	if budget <= 0 {
+		budget = 1500
+	}
 	repo := owner + "/" + name
 	info, err := r.GH.Repo(ctx, owner, name)
 	sum.APICalls++
@@ -189,30 +210,59 @@ func (r *Runner) walk(ctx context.Context, owner, name string, max int, stream c
 	if err != nil {
 		return "", err
 	}
-	emit(Event{T: "meta", Repo: repo, Branch: info.DefaultBranch, SHA: head, Commits: max})
+	emit(Event{T: "meta", Repo: repo, Branch: info.DefaultBranch, SHA: head, Commits: w.Max})
 
 	// The commit list gives 100 commits and their parents per request, so the
 	// first-parent chain costs one request per 100 commits, not one per commit.
+	// The list holds every ancestor, merged branches too, so Since bounds it: a
+	// busy repository's full list is thousands of pages.
 	parents := map[string][]string{}
-	page, more := 0, true
+	page, more, shifted := 0, true, false
 	var chain []string
 	cur := head
-	for len(chain) < max {
+	for len(chain) < w.Max {
 		ps, ok := parents[cur]
 		if !ok {
 			if !more {
+				if !w.Since.IsZero() {
+					sum.Edge = EdgePeriod
+				}
+				break
+			}
+			if sum.APICalls >= budget {
+				sum.Edge = EdgeBudget
 				break
 			}
 			page++
-			cs, next, err := r.GH.ListCommits(ctx, owner, name, github.ListOptions{SHA: head, Page: page, PerPage: 100})
+			cs, next, err := r.GH.ListCommits(ctx, owner, name, github.ListOptions{SHA: head, Since: w.Since, Page: page, PerPage: 100})
 			sum.APICalls++
 			if err != nil {
 				return head, err
+			}
+			if len(cs) == 0 && page == 1 && !w.Since.IsZero() && !shifted {
+				// A quiet repository: its head is older than the period. Walk the
+				// same span back from the head instead of nothing.
+				hc, hit, err := r.detail(ctx, owner, name, repo, head)
+				if !hit {
+					sum.APICalls++
+				}
+				if err != nil {
+					return head, err
+				}
+				last := hc.Commit.Author.Date.UTC()
+				span := time.Since(w.Since)
+				days := int(span.Hours()/24 + 0.5)
+				w.Since = last.Add(-span)
+				shifted, page = true, 0
+				emit(Event{T: "shift", Date: last.Format(time.RFC3339),
+					Msg: fmt.Sprintf("0 commits in the last %d days; walking the %d days before the last commit, %s", days, days, last.Format(time.DateOnly))})
+				continue
 			}
 			for _, c := range cs {
 				parents[c.SHA] = c.ParentSHAs()
 			}
 			more = next
+			emit(Event{T: "walk", I: page, Commits: len(parents)})
 			continue
 		}
 		chain = append(chain, cur)
@@ -222,11 +272,20 @@ func (r *Runner) walk(ctx context.Context, owner, name string, max int, stream c
 		}
 		cur = ps[0]
 	}
+	if len(chain) == w.Max && !sum.RootReached {
+		sum.Edge = EdgeMaxCommits
+	}
 
 	// Fetch the diffs in chunks: as many requests as fill one buffer, capped by the
-	// rate-limit budget. Requests within a chunk run in parallel.
+	// rate-limit budget and the run's call budget. Requests within a chunk run in
+	// parallel; a cached commit costs no call.
 	for i := 0; i < len(chain); {
-		n := min(r.Chunk(r.BufferCap), len(chain)-i)
+		left := budget - sum.APICalls
+		if left <= 0 {
+			sum.Edge = EdgeBudget
+			break
+		}
+		n := min(r.Chunk(r.BufferCap), len(chain)-i, left)
 		got := make([]github.Commit, n)
 		hit := make([]bool, n)
 		errs := make([]error, n)
@@ -319,7 +378,7 @@ func (r *Runner) replay(ctx context.Context, stream <-chan github.Commit, sum *S
 		return nil, err
 	}
 	sum.Commits = len(inverted)
-	emit(Event{T: "turnstile", Commits: len(inverted), Root: sum.RootReached})
+	emit(Event{T: "turnstile", Commits: len(inverted), Root: sum.RootReached, Edge: sum.Edge})
 
 	maxBytes := r.MaxBytes
 	if maxBytes == 0 {

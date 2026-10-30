@@ -745,7 +745,13 @@ function enterForward() {
 function handle(e) {
   switch (e.t) {
     case 'meta':
-      say(`${e.repo} · ${e.branch} @ ${e.sha.slice(0, 12)} · walking back up to ${e.commits} commits`);
+      say(`${e.repo} · ${e.branch} @ ${e.sha.slice(0, 12)} · walking back to ${periodSince()}, up to ${e.commits} commits`);
+      break;
+    case 'walk':
+      say(`listing the history · page ${e.i} · ${e.commits} commits found`);
+      break;
+    case 'shift':
+      say(e.msg);
       break;
     case 'invert':
       stats.commits = e.i; clock = -e.i;
@@ -756,7 +762,7 @@ function handle(e) {
     case 'turnstile':
       turnstile.position.set(0, 4.5, -depth - 8);
       turnstile.visible = true;
-      setPhase(e.root ? 'turnstile · root reached' : 'turnstile · window edge', 'inv');
+      setPhase(e.root ? 'turnstile · root reached' : `turnstile · ${e.edge || 'window'} edge`, 'inv');
       holdUntil = performance.now() + (reduced ? 300 : 2200);
       flyThrough = { t0: performance.now(), from: camera.position.clone() };
       break;
@@ -793,7 +799,7 @@ function showSummary(s) {
   $('sum-title').textContent = s.mismatch ? 'Reconstruction · mismatches found' : 'Reconstruction proven';
   $('sum-line').textContent = `${s.head_exact} of ${s.head_files} files at the head rebuilt byte-exact (${pct}%).`;
   const rows = [
-    ['commits walked', s.commits], ['root reached', s.root_reached ? 'yes' : 'no (window edge)'],
+    ['commits walked', s.commits], ['root reached', s.root_reached ? 'yes' : `no (stopped at the ${s.edge || 'window'} edge)`],
     ['file versions built', s.file_versions], ['proven exact', s.exact], ['  of them from a fetched blob', s.fetched],
     ['unproven', s.unknown], ['mismatch', s.mismatch],
     ['head files unproven', s.head_unknown], ['head files never built', s.head_missing],
@@ -846,13 +852,22 @@ function reset(repo) {
   hud();
 }
 
+// The period INVERT walks back to, the same one EXPLAIN reads: since from the
+// page's URL, else the selected number of days.
+function periodSince() {
+  const q = new URLSearchParams(location.search).get('since');
+  return q || new Date(Date.now() - Number($('period').value) * 864e5).toISOString().slice(0, 10);
+}
+
 $('query').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const repo = $('repo').value.trim();
   $('go').disabled = true;
   say('requesting inversion…');
   try {
-    const r = await fetch('/api/v1/reconstructions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repo }) });
+    // The run replaced here would keep spending the GitHub budget: stop it first.
+    if (sessionId && !runDone) fetch(`/api/v1/reconstructions/${sessionId}`, { method: 'DELETE' }).catch(() => {});
+    const r = await fetch('/api/v1/reconstructions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repo, since: periodSince() }) });
     const body = await r.json();
     if (!r.ok) throw new Error(body.error ? body.error.message : r.statusText);
     if (ws) { sessionId = null; ws.close(1000); }

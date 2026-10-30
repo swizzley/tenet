@@ -154,8 +154,61 @@ func TestWalkPagesPastTwoHundredCommits(t *testing.T) {
 		t.Fatalf("%+v %v; want all %d commits to the root", sum, err, firstParents)
 	}
 	sum, err = g.runner.Run(context.Background(), "o", "r", 210, func(Event) {})
-	if err != nil || sum.RootReached || sum.Commits != 210 {
-		t.Fatalf("%+v %v; want exactly 210 commits, root not reached", sum, err)
+	if err != nil || sum.RootReached || sum.Commits != 210 || sum.Edge != EdgeMaxCommits {
+		t.Fatalf("%+v %v; want exactly 210 commits, root not reached, edge %q", sum, err, EdgeMaxCommits)
+	}
+}
+
+// A period bounds the walk: the commit list is asked only back to Since, so a
+// busy repository's long history costs nothing. The rig stamps commit n at hour n.
+func TestWalkStopsAtThePeriod(t *testing.T) {
+	g := newRig(t, 230, 16)
+	since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Add(200 * time.Hour)
+	want := len(strings.Fields(g.repo.Git("rev-list", "--first-parent", "--since="+since.Format(time.RFC3339), "main")))
+	var rec recorder
+	sum, _, err := g.runner.RunFiles(context.Background(), "o", "r", Window{Max: 1000, Since: since}, rec.emit)
+	if err != nil || sum.RootReached || sum.Commits != want || sum.Edge != EdgePeriod {
+		t.Fatalf("%+v %v; want the %d commits since %s, edge %q", sum, err, want, since, EdgePeriod)
+	}
+	if want == 0 || want > 40 {
+		t.Fatalf("the window holds %d first-parent commits; the test wants a few", want)
+	}
+	walks := 0
+	for _, e := range rec.ev {
+		if e.T == "walk" {
+			walks++
+		}
+		if e.T == "turnstile" && e.Edge != EdgePeriod {
+			t.Fatalf("turnstile edge %q", e.Edge)
+		}
+	}
+	if walks != 1 {
+		t.Fatalf("%d list pages for a 30-commit window; want 1", walks)
+	}
+
+	// A quiet repository: no commit since the period's start. The walk takes the
+	// same span back from the last commit instead of nothing.
+	rec = recorder{}
+	quiet := time.Now().Add(-48 * time.Hour)
+	sum, _, err = g.runner.RunFiles(context.Background(), "o", "r", Window{Max: 1000, Since: quiet}, rec.emit)
+	if err != nil || sum.Commits == 0 || sum.Commits > 60 || sum.Edge != EdgePeriod {
+		t.Fatalf("%+v %v; want the commits of the 2 days before the last commit", sum, err)
+	}
+	shifts := 0
+	for _, e := range rec.ev {
+		if e.T == "shift" {
+			shifts++
+		}
+	}
+	if shifts != 1 {
+		t.Fatalf("%d shift events; want 1", shifts)
+	}
+
+	// A call budget stops a run that would spend more.
+	g.runner.MaxCalls = 20
+	sum, err = g.runner.Run(context.Background(), "o", "r", 1000, func(Event) {})
+	if err != nil || sum.Edge != EdgeBudget || sum.Commits == 0 || sum.Commits >= 230 {
+		t.Fatalf("%+v %v; want a short run stopped at the call budget", sum, err)
 	}
 }
 
@@ -263,7 +316,7 @@ func TestTamperedPatchIsCaught(t *testing.T) {
 		}
 	}
 	var rec recorder
-	sum, files, err := g.runner.RunFiles(context.Background(), "o", "r", 1000, rec.emit)
+	sum, files, err := g.runner.RunFiles(context.Background(), "o", "r", Window{Max: 1000}, rec.emit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,11 +435,11 @@ func TestUnknownRepoFails(t *testing.T) {
 func TestSessionsReplayAndLimit(t *testing.T) {
 	g := newRig(t, 15, 5)
 	m := &Manager{Runner: g.runner, MaxLive: 1, Keep: time.Minute, Timeout: time.Minute}
-	s, err := m.Start("o", "r", 1000)
+	s, err := m.Start("o", "r", Window{Max: 1000})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Start("o", "r", 1000); err != ErrBusy {
+	if _, err := m.Start("o", "r", Window{Max: 1000}); err != ErrBusy {
 		t.Fatalf("second start = %v, want ErrBusy", err)
 	}
 	var live []Event
@@ -416,7 +469,18 @@ func TestSessionsReplayAndLimit(t *testing.T) {
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		if _, err := m.Start("o", "r", 5); err == nil {
+		if c, err := m.Start("o", "r", Window{Max: 5}); err == nil {
+			// Cancel stops a run: it ends failed, and its slot frees.
+			c.Cancel()
+			for c.Status().State == "running" {
+				if time.Now().After(deadline) {
+					t.Fatal("a cancelled run kept running")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if st := c.Status(); st.State != "failed" || !strings.Contains(st.Error, "canceled") {
+				t.Fatalf("cancelled run: %+v", st)
+			}
 			break
 		}
 		if time.Now().After(deadline) {
