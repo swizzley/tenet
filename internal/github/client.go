@@ -6,6 +6,7 @@ package github
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -198,7 +199,9 @@ func (c *Client) once(ctx context.Context, lim *Limiter, method, rawURL string, 
 		out.Set("Link", prev.link)
 		return prev.body, out, -1, nil
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		if et := resp.Header.Get("ETag"); et != "" && method == http.MethodGet {
+		// Bodies over 1 MiB (blobs) are not kept: memory stays bounded, and a
+		// blob never changes, so its caller caches it by id.
+		if et := resp.Header.Get("ETag"); et != "" && method == http.MethodGet && len(data) <= 1<<20 {
 			c.remember(rawURL, cached{et, data, resp.Header.Get("Link")})
 		}
 		return data, hdr, -1, nil
@@ -443,6 +446,25 @@ func (c *Client) Tree(ctx context.Context, owner, name, sha string) (Tree, error
 	}
 	t.Truncated = raw.Truncated
 	return t, nil
+}
+
+// Blob returns a file's content by its blob id. GitHub sends it base64-encoded;
+// a body over the response cap fails to decode, and is an error.
+func (c *Client) Blob(ctx context.Context, owner, name, sha string) ([]byte, error) {
+	if !shaRe.MatchString(sha) {
+		return nil, fmt.Errorf("github: bad blob id %q", sha)
+	}
+	var raw struct {
+		Content  string `json:"content"`
+		Encoding string `json:"encoding"`
+	}
+	if _, err := c.getJSON(ctx, repoPath(owner, name)+"/git/blobs/"+sha, nil, &raw); err != nil {
+		return nil, err
+	}
+	if raw.Encoding != "base64" {
+		return nil, fmt.Errorf("github: blob %s comes as %q, not base64", sha[:12], raw.Encoding)
+	}
+	return base64.StdEncoding.DecodeString(strings.ReplaceAll(raw.Content, "\n", ""))
 }
 
 // HistoryNode is one commit from the GraphQL history, with its line counts.

@@ -57,10 +57,11 @@ type Event struct {
 	Dels     int    `json:"dels,omitempty"`
 	// For the page to paint the code. All of it is untrusted text from the
 	// repository; the page draws it on canvases, never as HTML.
-	Diff    []string `json:"diff,omitempty"`  // invert: the start of one file's patch, "+"/"-"/" " lines
-	Code    []string `json:"code,omitempty"`  // file: up to 16 lines of the rebuilt file, around the change
-	At      int      `json:"at,omitempty"`    // file: the line number of Code[0]
-	Added   []int    `json:"added,omitempty"` // file: indices into Code of the lines this patch added
+	Diff    []string `json:"diff,omitempty"`    // invert: the start of one file's patch, "+"/"-"/" " lines
+	Code    []string `json:"code,omitempty"`    // file: up to 16 lines of the rebuilt file, around the change
+	At      int      `json:"at,omitempty"`      // file: the line number of Code[0]
+	Added   []int    `json:"added,omitempty"`   // file: indices into Code of the lines this patch added
+	Fetched bool     `json:"fetched,omitempty"` // file: GitHub sent no patch; the blob was fetched by id
 	Commits int      `json:"commits,omitempty"`
 	Root    bool     `json:"root,omitempty"`
 	Summary *Summary `json:"summary,omitempty"`
@@ -75,6 +76,7 @@ type Summary struct {
 	Exact        int   `json:"exact"`         // ...whose blob id matched GitHub's
 	Unknown      int   `json:"unknown"`
 	Mismatch     int   `json:"mismatch"`
+	Fetched      int   `json:"fetched"`        // exact versions whose blob was fetched, GitHub having sent no patch
 	HeadFiles    int   `json:"head_files"`     // files in the head tree
 	HeadExact    int   `json:"head_exact"`     // ...rebuilt byte-exact
 	HeadUnknown  int   `json:"head_unknown"`   // ...present but unproven
@@ -93,6 +95,7 @@ type GitHub interface {
 	ListCommits(ctx context.Context, owner, name string, o github.ListOptions) ([]github.Commit, bool, error)
 	Commit(ctx context.Context, owner, name, sha string) (github.Commit, error)
 	Tree(ctx context.Context, owner, name, sha string) (github.Tree, error)
+	Blob(ctx context.Context, owner, name, sha string) ([]byte, error)
 }
 
 // Cache keeps commit details, which never change for a given id.
@@ -121,6 +124,7 @@ func (r *Runner) Run(ctx context.Context, owner, name string, max int, emit func
 type File struct {
 	Content []byte
 	Known   bool
+	Why     string // when unknown: the reason
 }
 
 // RunFiles is Run, and also returns the rebuilt files, so a viewer can open one.
@@ -137,8 +141,21 @@ func (r *Runner) RunFiles(ctx context.Context, owner, name string, max int, emit
 		defer close(stream)
 		head, walkErr = r.walk(ctx, owner, name, max, stream, sum, emit)
 	}()
-	files, err := r.replay(ctx, stream, sum, emit)
+	// Blob fetches are counted apart: the walker goroutine writes sum's counters.
+	var blobCalls, blobHits int
+	fetch := func(sha string) ([]byte, error) {
+		b, hit, err := r.blob(ctx, owner, name, sha)
+		if hit {
+			blobHits++
+		} else {
+			blobCalls++
+		}
+		return b, err
+	}
+	files, err := r.replay(ctx, stream, sum, emit, fetch)
 	wg.Wait()
+	sum.APICalls += blobCalls
+	sum.CacheHits += blobHits
 	if walkErr != nil {
 		return nil, nil, walkErr
 	}
@@ -151,7 +168,7 @@ func (r *Runner) RunFiles(ctx context.Context, owner, name string, max int, emit
 	sum.Millis = time.Since(start).Milliseconds()
 	out := make(map[string]File, len(files))
 	for p, f := range files {
-		out[p] = File{Content: f.content, Known: f.known}
+		out[p] = File{Content: f.content, Known: f.known, Why: f.why}
 	}
 	emit(Event{T: "done", Summary: sum})
 	return sum, out, nil
@@ -256,14 +273,35 @@ func (r *Runner) detail(ctx context.Context, owner, name, repo, sha string) (c g
 	return c, false, nil
 }
 
+// maxBlob is the largest blob a run fetches when GitHub sends no patch.
+const maxBlob = 20 << 20
+
+// blob returns a file's content by its blob id, from the cache when it holds it.
+// A blob id names its bytes, so a stored blob never goes stale.
+func (r *Runner) blob(ctx context.Context, owner, name, sha string) (b []byte, hit bool, err error) {
+	repo, key := owner+"/"+name, "blob:"+sha
+	if b, ok, err := r.Cache.Detail(ctx, repo, key); err == nil && ok {
+		return b, true, nil
+	}
+	if b, err = r.GH.Blob(ctx, owner, name, sha); err != nil {
+		return nil, false, err
+	}
+	if len(b) > maxBlob {
+		return nil, false, fmt.Errorf("the blob is %d MiB, over the %d MiB a run fetches", len(b)>>20, maxBlob>>20)
+	}
+	r.Cache.PutDetail(ctx, repo, key, b)
+	return b, false, nil
+}
+
 // file is one rebuilt file: its content when proven, or unknown.
 type file struct {
 	content []byte
 	known   bool
+	why     string // when unknown: the reason
 }
 
 // replay receives the inverted stream, then plays it forward.
-func (r *Runner) replay(ctx context.Context, stream <-chan github.Commit, sum *Summary, emit func(Event)) (map[string]*file, error) {
+func (r *Runner) replay(ctx context.Context, stream <-chan github.Commit, sum *Summary, emit func(Event), fetch func(string) ([]byte, error)) (map[string]*file, error) {
 	var inverted []github.Commit
 	for c := range stream {
 		inverted = append(inverted, c)
@@ -297,7 +335,7 @@ func (r *Runner) replay(ctx context.Context, stream <-chan github.Commit, sum *S
 		emit(Event{T: "commit", I: len(inverted) - i, SHA: c.SHA, Author: author(c), Date: c.Commit.Author.Date.UTC().Format(time.RFC3339),
 			Headline: headline(c.Commit.Message), Files: len(c.Files)})
 		for _, f := range c.Files {
-			ev, delta := apply(files, f, sum.RootReached)
+			ev, delta := apply(files, f, sum.RootReached, fetch)
 			total += delta
 			if total > maxBytes {
 				return nil, fmt.Errorf("reconstruct: rebuilt content passed %d MiB; walk fewer commits", maxBytes>>20)
@@ -305,6 +343,9 @@ func (r *Runner) replay(ctx context.Context, stream <-chan github.Commit, sum *S
 			switch ev.Status {
 			case "exact":
 				sum.Exact++
+				if ev.Fetched {
+					sum.Fetched++
+				}
 			case "unknown":
 				sum.Unknown++
 			case "mismatch":
@@ -321,7 +362,7 @@ func (r *Runner) replay(ctx context.Context, stream <-chan github.Commit, sum *S
 
 // apply plays one file change and proves the result. It returns the event and the
 // change in rebuilt bytes.
-func apply(files map[string]*file, f github.File, fromRoot bool) (Event, int) {
+func apply(files map[string]*file, f github.File, fromRoot bool, fetch func(sha string) ([]byte, error)) (Event, int) {
 	ev := Event{T: "file", Path: f.Filename, Op: f.Status, Adds: f.Additions, Dels: f.Deletions}
 	before := 0
 	if old := files[f.Filename]; old != nil {
@@ -355,25 +396,47 @@ func apply(files map[string]*file, f github.File, fromRoot bool) (Event, int) {
 	}
 	out := &file{}
 	switch {
-	case !base.known:
-		ev.Status, ev.Why = "unknown", why
-	case f.Patch == "" && f.Changes == 0 && f.SHA == "":
+	case f.Patch == "" && f.SHA == "":
 		// A mode-only change: GitHub sends no patch and no blob id (VERIFIED live
-		// 2026-10-30, google/uuid 386477fd90). The bytes are the proven previous
-		// version, unchanged; the head-tree check confirms them at the end.
+		// 2026-10-30, google/uuid 386477fd90). The bytes are the previous
+		// version's; the head-tree check confirms them at the end.
+		if !base.known {
+			ev.Status, ev.Why = "unknown", why
+			break
+		}
 		out = &file{content: base.content, known: true}
 		ev.Status, ev.Why = "exact", "mode change only; content unchanged"
 		ev.Lines = strings.Count(string(base.content), "\n")
-	case f.Patch == "" && f.Changes > 0:
-		ev.Status, ev.Why = "unknown", "GitHub sent no patch (binary or too large)"
+	case f.Patch == "" && base.known && f.SHA == patch.BlobSHA(base.content):
+		// No patch because the bytes are the same (a pure rename, an empty file).
+		out = &file{content: base.content, known: true}
+		ev.Status = "exact"
+		ev.Lines = strings.Count(string(base.content), "\n")
+	case f.Patch == "":
+		// GitHub sends no patch for a binary file or a very large diff (live:
+		// tensorwire/mongoose, a +2,929 −15 change, after which every later
+		// version of that file read as unproven; and 10 binaries that read as
+		// mismatches). The blob is fetched by the id GitHub reports and proven by
+		// its hash, so the file's history continues from there.
+		content, err := fetch(f.SHA)
+		switch {
+		case err != nil:
+			ev.Status, ev.Why = "unknown", "GitHub sent no patch, and fetching the blob failed: "+err.Error()
+		case patch.BlobSHA(content) != f.SHA:
+			ev.Status, ev.Why = "mismatch", "the fetched blob hashes to "+patch.BlobSHA(content)[:12]+", not "+short(f.SHA)
+		default:
+			out = &file{content: content, known: true}
+			ev.Status, ev.Fetched = "exact", true
+			ev.Why = "GitHub sent no patch (a binary or a large diff); the blob, fetched by id, matches"
+			ev.Lines = strings.Count(string(content), "\n")
+		}
+	case !base.known:
+		ev.Status, ev.Why = "unknown", why
 	default:
-		content := base.content
-		if f.Patch != "" {
-			var err error
-			if content, err = patch.Apply(base.content, f.Patch); err != nil {
-				ev.Status, ev.Why = "unknown", err.Error()
-				break
-			}
+		content, err := patch.Apply(base.content, f.Patch)
+		if err != nil {
+			ev.Status, ev.Why = "unknown", err.Error()
+			break
 		}
 		if got := patch.BlobSHA(content); got != f.SHA {
 			ev.Status, ev.Why = "mismatch", "blob "+got[:12]+" but GitHub says "+short(f.SHA)
@@ -383,6 +446,9 @@ func apply(files map[string]*file, f github.File, fromRoot bool) (Event, int) {
 		ev.Status = "exact"
 		ev.Lines = strings.Count(string(content), "\n")
 		ev.Code, ev.At, ev.Added = excerpt(content, f.Patch)
+	}
+	if !out.known {
+		out.why = ev.Why
 	}
 	files[f.Filename] = out
 	return ev, len(out.content) - before

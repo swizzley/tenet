@@ -1,154 +1,347 @@
-// Tenet: reconstruct a repository from its diffs, as a temporal pincer.
-// Phase 1 (red, inverted): the server walks back through history; each commit
-// arrives as a ring receding down a tunnel, its headline mirrored, its diff
-// un-writing itself, while particles fall inward (entropy running backward). The
-// turnstile flips time. Phase 2 (blue, forward): each diff replays; each rebuilt
-// file paints itself, then folds into its tower in a city of directories, a tower
-// built of one layer per change. The viewer turns, zooms, hovers and opens files.
+// Tenet: reconstruct a repository from its diffs, as a temporal pincer, in a
+// night city.
+// Phase 1 (red, inverted): the server walks back through history. The camera
+// runs down an avenue at street level; each commit raises a red neon arch with
+// its headline mirrored, its diff un-writes itself, rain falls upward and the
+// traffic flies backward. The turnstile flips time.
+// Phase 2 (blue, forward): each diff replays. Each directory is a city block and
+// each file a skyscraper: one band of floors per change, cyan for lines added,
+// magenta for lines removed, a roof beacon for its proof. Billboards flash the
+// headlines; the viewer orbits (right-drag), hovers and opens files and diffs.
+// The world is procedural and seeded by the repository's name.
 // All server text is untrusted: it is drawn on canvases or set with textContent.
-import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+//
+// Libraries (pinned): three.js 0.186.1 with its OrbitControls and the bloom
+// post-processing chain, and simplex-noise 4.0.3. jsdelivr's +esm builds import
+// three from one URL, so the addons share the page's copy without an importmap.
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.186.1/+esm';
+import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.186.1/examples/jsm/controls/OrbitControls.js/+esm';
+import { EffectComposer } from 'https://cdn.jsdelivr.net/npm/three@0.186.1/examples/jsm/postprocessing/EffectComposer.js/+esm';
+import { RenderPass } from 'https://cdn.jsdelivr.net/npm/three@0.186.1/examples/jsm/postprocessing/RenderPass.js/+esm';
+import { UnrealBloomPass } from 'https://cdn.jsdelivr.net/npm/three@0.186.1/examples/jsm/postprocessing/UnrealBloomPass.js/+esm';
+import { OutputPass } from 'https://cdn.jsdelivr.net/npm/three@0.186.1/examples/jsm/postprocessing/OutputPass.js/+esm';
+import { createNoise2D } from 'https://cdn.jsdelivr.net/npm/simplex-noise@4.0.3/+esm';
 
-const RED = new THREE.Color(0xff3b3b), BLUE = new THREE.Color(0x3d8bff);
 const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const $ = (id) => document.getElementById(id);
+const CYAN = new THREE.Color(0x22e5ff), MAGENTA = new THREE.Color(0xff2bd6), RED = new THREE.Color(0xff3b3b);
+const NEON = [0x22e5ff, 0xff2bd6, 0xffb547, 0x7cff6b, 0x9b5cff];
+const BEACON = { exact: 0x3dff8a, unknown: 0xffb547, mismatch: 0xff3b3b };
 
-// ---------- scene ----------
-const renderer = new THREE.WebGLRenderer({ canvas: $('scene'), antialias: true });
+// ---------- seeded randomness: one city per repository ----------
+function mulberry32(a) {
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hashStr(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619);
+  return h >>> 0;
+}
+let rand = mulberry32(20261030), noise = createNoise2D(mulberry32(7));
+
+// ---------- renderer, camera, post ----------
+const canvas = $('scene');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x030407);
-scene.fog = new THREE.FogExp2(0x030407, 0.012);
-const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 2000);
-camera.position.set(0, 0, 12);
-scene.add(new THREE.AmbientLight(0x404858, 1.2));
-const key = new THREE.PointLight(0xffffff, 60, 0, 1.6);
-key.position.set(6, 18, 10);
-scene.add(key);
+scene.fog = new THREE.FogExp2(0x160a26, 0.0075);
+const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 3000);
+camera.position.set(0, 3.2, 12);
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 1.1, 0.55, 0.6);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+// The camera orbits on the right button; the left one is for picking a building.
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+controls.dampingFactor = 0.07;
+controls.mouseButtons = { LEFT: null, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE };
+controls.minDistance = 6;
+controls.maxDistance = 700;
+controls.maxPolarAngle = 1.48;
+controls.enabled = false;
+let viewerMoved = false; // once the viewer turns or zooms, the camera stops following the city's growth
+controls.addEventListener('start', () => { viewerMoved = true; });
 
 function resize() {
   renderer.setSize(innerWidth, innerHeight, false);
+  composer.setSize(innerWidth, innerHeight);
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
 }
 addEventListener('resize', resize);
 resize();
 
-// The particle field: in the inverted phase points fall toward the axis, in the
-// forward phase they fly outward. Same motion, opposite sign: inversion.
-const N = reduced ? 600 : 2600;
-const pGeo = new THREE.BufferGeometry();
-const pos = new Float32Array(N * 3), vel = new Float32Array(N * 3);
-for (let i = 0; i < N; i++) seedParticle(i, true);
-pGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-const pMat = new THREE.PointsMaterial({ size: 0.09, color: 0x8a96b0, transparent: true, opacity: 0.8, blending: THREE.AdditiveBlending, depthWrite: false });
-scene.add(new THREE.Points(pGeo, pMat));
-function seedParticle(i, anywhere) {
-  const r = anywhere ? 4 + Math.random() * 40 : 30 + Math.random() * 15;
-  const a = Math.random() * Math.PI * 2;
-  pos[i * 3] = Math.cos(a) * r;
-  pos[i * 3 + 1] = Math.sin(a) * r * 0.7;
-  pos[i * 3 + 2] = camera.position.z - Math.random() * 160;
-  vel[i * 3] = -Math.cos(a); vel[i * 3 + 1] = -Math.sin(a) * 0.7; vel[i * 3 + 2] = 0;
+// ---------- sky, light, ground ----------
+const sky = new THREE.Mesh(new THREE.SphereGeometry(1500, 32, 16), new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false, fog: false,
+  uniforms: { top: { value: new THREE.Color(0x04020a) }, horizon: { value: new THREE.Color(0x3a0f22) }, glow: { value: new THREE.Color(0xff3b3b) } },
+  vertexShader: 'varying vec3 vp; void main(){ vp = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+  fragmentShader: 'uniform vec3 top, horizon, glow; varying vec3 vp; void main(){ float h = max(vp.y, 0.0); vec3 c = mix(horizon, top, pow(h, 0.42)); c += glow * 0.10 * pow(1.0 - h, 10.0); gl_FragColor = vec4(c, 1.0); }',
+}));
+scene.add(sky);
+const SKY = { inv: [0x04020a, 0x3a0f22, 0xff3b3b], fwd: [0x03030c, 0x1c1446, 0x22e5ff] };
+let skyMood = SKY.inv;
+const _c = new THREE.Color();
+function stepSky(dt) {
+  const u = sky.material.uniforms, k = Math.min(1, dt * 1.5);
+  u.top.value.lerp(_c.setHex(skyMood[0]), k);
+  u.horizon.value.lerp(_c.setHex(skyMood[1]), k);
+  u.glow.value.lerp(_c.setHex(skyMood[2]), k);
+  scene.fog.color.copy(u.horizon.value).multiplyScalar(0.55);
 }
-let entropy = -1; // -1: inverted (implode), +1: forward (explode)
 
-// ---------- text on canvas ----------
-function label(text, color, mirrored, w = 512, h = 64, size = 26) {
+scene.add(new THREE.HemisphereLight(0x6a5cff, 0x08050f, 0.9));
+const moon = new THREE.DirectionalLight(0x8aa0ff, 0.45);
+moon.position.set(-80, 120, 60);
+scene.add(moon);
+const neonLights = NEON.slice(0, 3).map((c) => { const l = new THREE.PointLight(c, 40, 90, 1.4); scene.add(l); return l; });
+
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(6000, 6000), new THREE.MeshStandardMaterial({ color: 0x07070d, roughness: 0.32, metalness: 0.55 }));
+ground.rotation.x = -Math.PI / 2;
+scene.add(ground);
+
+// ---------- textures ----------
+// Lit windows: a grid of panes, some dark, as an emissive map. One texture
+// for the skyline's tall blocks, one with fewer rows for a building's floor band.
+function windowsTexture(rows, seed) {
   const c = document.createElement('canvas');
-  c.width = w; c.height = h;
+  c.width = 64; c.height = rows * 8;
   const g = c.getContext('2d');
-  if (mirrored) { g.translate(w, 0); g.scale(-1, 1); }
-  g.font = `${size}px ui-monospace, Menlo, monospace`;
-  g.fillStyle = color;
-  g.textBaseline = 'middle';
-  g.fillText(String(text).slice(0, 48), 8, h / 2);
+  const r = mulberry32(seed);
+  g.fillStyle = '#000';
+  g.fillRect(0, 0, c.width, c.height);
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < 4; x++) {
+      if (r() < 0.38) continue;
+      const v = Math.floor(110 + r() * 145);
+      g.fillStyle = `rgb(${v},${v},${v})`;
+      g.fillRect(4 + x * 15, 2 + y * 8, 10, 5);
+    }
+  }
   const t = new THREE.CanvasTexture(c);
   t.colorSpace = THREE.SRGBColorSpace;
   return t;
 }
+const tallWindows = windowsTexture(48, 11), floorWindows = windowsTexture(4, 23);
 
-// ---------- phase 1: the inverted tunnel ----------
-const tunnel = new THREE.Group();
-scene.add(tunnel);
-const ringGeo = new THREE.TorusGeometry(5, 0.035, 8, 96);
+// label draws neon text on a canvas, mirrored when it is read from the far side of time.
+function label(text, color, mirrored, w = 512, h = 72, size = 30) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const g = c.getContext('2d');
+  if (mirrored) { g.translate(w, 0); g.scale(-1, 1); }
+  g.font = `600 ${size}px ui-monospace, Menlo, monospace`;
+  g.textBaseline = 'middle';
+  g.shadowColor = color;
+  g.shadowBlur = 14;
+  g.fillStyle = color;
+  g.fillText(String(text).slice(0, 44), 10, h / 2);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+function dispose(o, parent) {
+  parent.remove(o);
+  o.traverse((x) => {
+    if (x.material) { if (x.material.map) x.material.map.dispose(); x.material.dispose(); }
+  });
+}
+
+// ---------- the skyline: a seeded ring of distant towers ----------
+const box = new THREE.BoxGeometry(1, 1, 1);
+const SKYLINE = reduced ? 220 : 520;
+const skyline = new THREE.InstancedMesh(box, new THREE.MeshBasicMaterial({ map: tallWindows }), SKYLINE);
+scene.add(skyline);
+const _o = new THREE.Object3D();
+function buildSkyline() {
+  for (let i = 0; i < SKYLINE; i++) {
+    const a = rand() * Math.PI * 2, r = 150 + rand() * 300;
+    const x = Math.cos(a) * r, z = Math.sin(a) * r;
+    const n = 0.5 + 0.5 * noise(x * 0.006, z * 0.006);
+    const h = 10 + 110 * n * n * (1.25 - (r - 150) / 400), w = 5 + rand() * 9;
+    _o.position.set(x, h / 2, z);
+    _o.rotation.set(0, rand() * Math.PI, 0);
+    _o.scale.set(w, h, w);
+    _o.updateMatrix();
+    skyline.setMatrixAt(i, _o.matrix);
+    skyline.setColorAt(i, _c.setHex(NEON[Math.floor(rand() * NEON.length)]).multiplyScalar(0.25 + rand() * 0.35));
+  }
+  skyline.instanceMatrix.needsUpdate = true;
+  skyline.instanceColor.needsUpdate = true;
+}
+
+// ---------- phase 1: the inverted avenue ----------
+const avenue = new THREE.Group();
+scene.add(avenue);
+const arches = new THREE.Group();
+avenue.add(arches);
+const archMat = new THREE.MeshBasicMaterial({ color: RED });
 let depth = 0;
+const SPACING = 5;
 function invertCommit(e) {
-  depth = e.i * 3.2;
-  const ring = new THREE.Mesh(ringGeo, new THREE.MeshBasicMaterial({ color: RED, transparent: true, opacity: 0.9 }));
-  ring.position.z = -depth;
-  ring.rotation.z = Math.random() * Math.PI;
-  ring.userData.spin = (Math.random() - 0.5) * 0.02;
-  tunnel.add(ring);
-  // the headline, mirrored: read from the other side of the turnstile
-  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: label(e.headline || e.sha.slice(0, 12), '#ff6b6b', true), transparent: true, opacity: 0.85, depthWrite: false }));
-  sp.scale.set(8, 1, 1);
-  sp.position.set((e.i % 2 ? 1 : -1) * 3.2, (e.i % 3 - 1) * 1.6, -depth);
-  tunnel.add(sp);
-  while (tunnel.children.length > 160) dispose(tunnel.children[0], tunnel);
+  depth = e.i * SPACING;
+  const arch = new THREE.Group();
+  for (const x of [-5, 5]) {
+    const p = new THREE.Mesh(box, archMat);
+    p.scale.set(0.35, 8, 0.35);
+    p.position.set(x, 4, 0);
+    arch.add(p);
+  }
+  const beam = new THREE.Mesh(box, archMat);
+  beam.scale.set(10.7, 0.35, 0.35);
+  beam.position.y = 8;
+  arch.add(beam);
+  const sign = new THREE.Sprite(new THREE.SpriteMaterial({ map: label(e.headline || e.sha.slice(0, 12), '#ff5a5a', true), transparent: true, depthWrite: false }));
+  sign.scale.set(9, 1.26, 1);
+  sign.position.y = 9.3;
+  arch.add(sign);
+  arch.position.z = -depth;
+  arches.add(arch);
+  while (arches.children.length > 140) {
+    const old = arches.children[0];
+    old.children.at(-1).material.map.dispose();
+    old.children.at(-1).material.dispose();
+    arches.remove(old);
+  }
 }
+// The avenue's walls: towers on both sides, every 10 units of the street. Each
+// one's size and color follow from its place (seeded noise), so a building stays
+// the same as the camera passes; the 100 slots a side are recycled around it.
+const WALLS = 200;
+const walls = new THREE.InstancedMesh(box, new THREE.MeshBasicMaterial({ map: tallWindows }), WALLS);
+avenue.add(walls);
+function stepWalls() {
+  const base = Math.floor(camera.position.z / 10) * 10;
+  for (let i = 0; i < WALLS; i++) {
+    const side = i % 2 ? 1 : -1, z = base + 30 - (i >> 1) * 10;
+    const n = 0.5 + 0.5 * noise(z * 0.037, side * 3.1), m = 0.5 + 0.5 * noise(z * 0.11 + 9, side);
+    const h = 12 + 55 * n * n, w = 6 + 6 * m;
+    _o.position.set(side * (12 + w / 2), h / 2, z);
+    _o.rotation.set(0, 0, 0);
+    _o.scale.set(w, h, 8);
+    _o.updateMatrix();
+    walls.setMatrixAt(i, _o.matrix);
+    walls.setColorAt(i, _c.setHex(m > 0.35 ? 0xff2b4a : NEON[Math.floor(m * 13) % NEON.length]).multiplyScalar(0.3 + 0.3 * n));
+  }
+  walls.instanceMatrix.needsUpdate = true;
+  walls.instanceColor.needsUpdate = true;
+}
+const laneLines = new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints([-3, 3, -9, 9].flatMap((x) =>
+  [new THREE.Vector3(x, 0.02, 40), new THREE.Vector3(x, 0.02, -8000)])), new THREE.LineBasicMaterial({ color: 0xff3b5a, transparent: true, opacity: 0.55 }));
+avenue.add(laneLines);
 
-// ---------- the turnstile ----------
 const turnstile = new THREE.Group();
-for (let k = 0; k < 3; k++) {
-  const t = new THREE.Mesh(new THREE.TorusGeometry(6.5 + k * 0.6, 0.06, 8, 160), new THREE.MeshBasicMaterial({ color: k === 1 ? 0xffffff : RED, transparent: true, opacity: 0.7 }));
-  turnstile.add(t);
-}
+for (let k = 0; k < 3; k++) turnstile.add(new THREE.Mesh(new THREE.TorusGeometry(6.5 + k * 0.6, 0.07, 8, 160), new THREE.MeshBasicMaterial({ color: k === 1 ? 0xffffff : RED })));
 for (let k = 0; k < 8; k++) {
-  const spoke = new THREE.Mesh(new THREE.BoxGeometry(0.06, 6.2, 0.06), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5 }));
+  const spoke = new THREE.Mesh(box, new THREE.MeshBasicMaterial({ color: 0xffffff }));
+  spoke.scale.set(0.07, 12.4, 0.07);
   spoke.rotation.z = (k / 8) * Math.PI;
   turnstile.add(spoke);
 }
 turnstile.visible = false;
 scene.add(turnstile);
 
-// ---------- phase 2: the forward city ----------
+// ---------- phase 2: the city ----------
+// Each directory is a city block on a square spiral of the street grid; a block
+// holds 25 lots, and a directory with more files takes the next free block too.
+// Each file is a skyscraper: one band of floors per change, as tall as the lines
+// it changed, its windows lit cyan (added) through magenta (removed), a neon
+// floor line on top of the band, and a roof with an antenna and a beacon for the
+// file's proof.
 const city = new THREE.Group();
 scene.add(city);
-const box = new THREE.BoxGeometry(1, 1, 1);
-const shardGeo = new THREE.TetrahedronGeometry(0.16);
-// The city: each directory is a district on a golden-angle spiral; each file is a
-// tower in its district (a smaller spiral). A tower is its history: one layer per
-// change, as thick as the lines it changed, colored from red (lines removed) to
-// blue (lines added). Its cap shows the file's proof: white exact, amber
-// unproven, magenta mismatch.
-const dirs = new Map();   // dir -> {x, z, next, files: Map(path -> tower)}
+const BLOCK = 14;
+const CELLS = (() => {
+  const out = [];
+  for (let r = 0; r <= 14; r++) {
+    const ring = [];
+    for (let i = -r; i <= r; i++) for (let j = -r; j <= r; j++) if (Math.max(Math.abs(i), Math.abs(j)) === r) ring.push([i, j]);
+    ring.sort((a, b) => Math.atan2(a[1], a[0]) - Math.atan2(b[1], b[0]));
+    out.push(...ring);
+  }
+  return out;
+})();
+const LOTS = (() => {
+  const out = [];
+  for (let i = -2; i <= 2; i++) for (let j = -2; j <= 2; j++) out.push([i * 2.5, j * 2.5]);
+  return out.sort((a, b) => Math.hypot(...a) - Math.hypot(...b));
+})();
+const streets = new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints((() => {
+  const pts = [], L = 14 * BLOCK + BLOCK / 2;
+  for (let i = -14; i <= 15; i++) {
+    const v = (i - 0.5) * BLOCK;
+    pts.push(new THREE.Vector3(v, 0.03, -L), new THREE.Vector3(v, 0.03, L), new THREE.Vector3(-L, 0.03, v), new THREE.Vector3(L, 0.03, v));
+  }
+  return pts;
+})()), new THREE.LineBasicMaterial({ color: 0x2a6bff, transparent: true, opacity: 0.35 }));
+city.add(streets);
+const plateMat = new THREE.MeshStandardMaterial({ color: 0x0d0e18, roughness: 0.6, metalness: 0.3 });
+const shaftMat = new THREE.MeshStandardMaterial({ color: 0x1a1c26, roughness: 0.5, metalness: 0.6 });
+
+const dirs = new Map(); // dir -> {cells: [[x, z]], next, files: Map(path -> tower), hue}
+let nextCell = 0;
 const shards = [];
-const pickables = [];     // the layers and caps a pointer can hover or click
-const ADDED = new THREE.Color(0x3d8bff), REMOVED = new THREE.Color(0xff3b3b);
-const CAP = { exact: 0xeef4ff, unknown: 0xffb547, mismatch: 0xff2bd6 };
-const MAX_LAYERS = 120;   // a tower keeps its newest changes; older ones count in tw.dropped
-let commitNow = null;     // the commit being replayed, for its layers
-let extent = 6;           // how far the city reaches, for the camera
+const pickables = []; // floor bands, their neon lines, roofs and beacons
+const MAX_LAYERS = 120; // a tower keeps its newest changes; older ones count in tw.dropped
+let commitNow = null;   // the commit being replayed, for its floor bands
+let extent = 10;        // how far the city reaches, for the camera
 function dirOf(path) { const i = path.lastIndexOf('/'); return i < 0 ? '/' : path.slice(0, i); }
 function dirSlot(d) {
-  if (!dirs.has(d)) {
-    const k = dirs.size, r = k ? 9 * Math.sqrt(k) : 0, a = k * 2.39996;
-    const x = Math.cos(a) * r, z = Math.sin(a) * r;
-    const base = new THREE.Sprite(new THREE.SpriteMaterial({ map: label(d, '#7c8597', false, 512, 48, 22), transparent: true, opacity: 0.8, depthWrite: false }));
-    base.scale.set(5, 0.47, 1);
-    base.position.set(x, -0.6, z + 3.2);
-    city.add(base);
-    dirs.set(d, { x, z, next: 0, files: new Map() });
-  }
+  if (!dirs.has(d)) dirs.set(d, { cells: [], next: 0, files: new Map(), hue: NEON[hashStr(d) % NEON.length], name: d });
   return dirs.get(d);
 }
-function lot(slot) { // the next free tower position in a district
-  const j = slot.next++, r = j ? 1.9 * Math.sqrt(j) : 0, a = j * 2.39996;
-  const p = { x: slot.x + Math.cos(a) * r, z: slot.z + Math.sin(a) * r };
-  extent = Math.max(extent, Math.hypot(p.x, p.z) + 4);
-  return p;
+function newBlock(slot) {
+  const [i, j] = CELLS[Math.min(nextCell++, CELLS.length - 1)];
+  const x = i * BLOCK, z = j * BLOCK;
+  const plate = new THREE.Mesh(box, plateMat);
+  plate.scale.set(BLOCK - 1, 0.18, BLOCK - 1);
+  plate.position.set(x, 0.09, z);
+  city.add(plate);
+  const h = (BLOCK - 1) / 2;
+  const edge = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints([[-h, -h], [h, -h], [h, h], [-h, h]].map(([a, b]) => new THREE.Vector3(x + a, 0.2, z + b))),
+    new THREE.LineBasicMaterial({ color: slot.hue }));
+  city.add(edge);
+  if (!slot.cells.length) {
+    const sign = new THREE.Sprite(new THREE.SpriteMaterial({ map: label(slot.name, '#' + slot.hue.toString(16).padStart(6, '0'), false, 512, 64, 26), transparent: true, depthWrite: false }));
+    sign.scale.set(6.5, 0.8, 1);
+    sign.position.set(x, 0.9, z + h + 0.6);
+    city.add(sign);
+  }
+  slot.cells.push([x, z]);
+  extent = Math.max(extent, Math.hypot(x, z) + BLOCK);
+}
+function lot(slot) {
+  if (slot.next % LOTS.length === 0) newBlock(slot);
+  const [x, z] = slot.cells.at(-1), [dx, dz] = LOTS[slot.next++ % LOTS.length];
+  return { x: x + dx, z: z + dz };
 }
 function newTower(slot, path) {
   const p = lot(slot);
   const group = new THREE.Group();
-  group.position.set(p.x, 0, p.z);
+  group.position.set(p.x, 0.18, p.z);
   city.add(group);
-  const cap = new THREE.Mesh(box, new THREE.MeshStandardMaterial({ emissiveIntensity: 0.9, roughness: 0.3 }));
-  cap.scale.set(1.42, 0.09, 1.42);
+  const roof = new THREE.Mesh(box, shaftMat);
+  roof.scale.set(2.1, 0.22, 2.1);
+  const antenna = new THREE.Mesh(box, shaftMat);
+  antenna.scale.set(0.06, 1.6, 0.06);
+  const beacon = new THREE.Mesh(new THREE.SphereGeometry(0.17, 12, 8), new THREE.MeshBasicMaterial({ color: BEACON.unknown }));
+  const cap = new THREE.Group();
+  antenna.position.y = 0.9;
+  beacon.position.y = 1.75;
+  cap.add(roof, antenna, beacon);
   group.add(cap);
-  const tw = { path, group, cap, layers: [], top: 0, versions: 0, dropped: 0, status: '', lines: 0 };
-  cap.userData.tower = tw;
-  pickables.push(cap);
+  const tw = { path, group, cap, beacon, layers: [], top: 0, versions: 0, dropped: 0, status: '', lines: 0 };
+  for (const m of [roof, beacon]) { m.userData = { tower: tw, cap: true }; pickables.push(m); }
   slot.files.set(path, tw);
   return tw;
 }
@@ -158,20 +351,23 @@ function forwardFile(e) {
   const slot = dirSlot(dirOf(e.path));
   const tw = slot.files.get(e.path) || newTower(slot, e.path);
   const adds = e.adds || 0, dels = e.dels || 0;
-  const col = REMOVED.clone().lerp(ADDED, adds + dels ? adds / (adds + dels) : 0.5);
-  const th = Math.min(1.4, 0.1 + Math.log2(1 + adds + dels) * 0.1);
-  const m = new THREE.Mesh(box, new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: 0.45, roughness: 0.4, metalness: 0.15 }));
-  m.scale.set(1.3, 0.001, 1.3);
-  m.position.y = tw.top;
-  m.userData = { tower: tw, th, y: tw.top + th / 2, flash: 1, adds, dels, commit: commitNow };
-  tw.group.add(m);
-  tw.layers.push(m);
-  pickables.push(m);
+  const col = MAGENTA.clone().lerp(CYAN, adds + dels ? adds / (adds + dels) : 0.5);
+  const th = Math.min(2.4, 0.4 + Math.log2(1 + adds + dels) * 0.24);
+  const band = new THREE.Mesh(box, new THREE.MeshStandardMaterial({ color: 0x0b0d16, roughness: 0.3, metalness: 0.7, emissive: col, emissiveMap: floorWindows, emissiveIntensity: 1.1 }));
+  band.scale.set(2, 0.001, 2);
+  band.position.y = tw.top;
+  const line = new THREE.Mesh(box, new THREE.MeshBasicMaterial({ color: col }));
+  line.scale.set(2.06, 0.05, 2.06);
+  line.position.y = tw.top;
+  band.userData = { tower: tw, th, y: tw.top + th / 2, flash: 1, adds, dels, commit: commitNow, fetched: !!e.fetched, line };
+  line.userData = band.userData;
+  tw.group.add(band, line);
+  tw.layers.push(band);
+  pickables.push(band, line);
   tw.top += th;
-  if (tw.layers.length > MAX_LAYERS) { // drop the oldest layer; the rest settle down
+  if (tw.layers.length > MAX_LAYERS) { // drop the oldest band; the rest settle down
     const old = tw.layers.shift();
-    pickables.splice(pickables.indexOf(old), 1);
-    dispose(old, tw.group);
+    for (const m of [old, old.userData.line]) { pickables.splice(pickables.indexOf(m), 1); dispose(m, tw.group); }
     tw.dropped++;
     tw.top -= old.userData.th;
     for (const l of tw.layers) l.userData.y -= old.userData.th;
@@ -179,16 +375,16 @@ function forwardFile(e) {
   tw.versions++;
   tw.status = e.status;
   tw.lines = e.lines || 0;
-  tw.cap.material.color.setHex(CAP[e.status] ?? CAP.unknown);
-  tw.cap.material.emissive.setHex(CAP[e.status] ?? CAP.unknown);
-  // un-shatter: shards start scattered and converge on the new layer
+  tw.beacon.material.color.setHex(BEACON[e.status] ?? BEACON.unknown);
+  // data motes converge on the new band
   const to = new THREE.Vector3(tw.group.position.x, tw.top, tw.group.position.z);
-  const n = reduced ? 2 : Math.min(14, 3 + adds / 6);
-  for (let k = 0; k < n && shards.length < 700; k++) {
-    const s = new THREE.Mesh(shardGeo, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.95 }));
-    const a = Math.random() * Math.PI * 2, r = 8 + Math.random() * 14;
-    s.position.set(slot.x + Math.cos(a) * r, to.y + (Math.random() - 0.2) * 12, slot.z + Math.sin(a) * r);
-    s.userData = { from: s.position.clone(), dest: to, t: 0, dur: 0.6 + Math.random() * 0.5, inward: true };
+  const n = reduced ? 2 : Math.min(12, 3 + adds / 8);
+  for (let k = 0; k < n && shards.length < 600; k++) {
+    const s = new THREE.Mesh(box, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.95 }));
+    s.scale.setScalar(0.14);
+    const a = rand() * Math.PI * 2, r = 8 + rand() * 14;
+    s.position.set(to.x + Math.cos(a) * r, to.y + (rand() - 0.2) * 12, to.z + Math.sin(a) * r);
+    s.userData = { from: s.position.clone(), dest: to, t: 0, dur: 0.6 + rand() * 0.5, inward: true };
     city.add(s);
     shards.push(s);
   }
@@ -200,30 +396,98 @@ function removeFile(path, burst) {
   slot.files.delete(path);
   if (burst) { // deletion runs forward: the tower shatters outward
     const at = tw.group.position.clone().setY(tw.top / 2);
-    for (let k = 0; k < 8 && shards.length < 700; k++) {
-      const s = new THREE.Mesh(shardGeo, new THREE.MeshBasicMaterial({ color: 0x8a96b0, transparent: true, opacity: 0.9 }));
+    for (let k = 0; k < 10 && shards.length < 600; k++) {
+      const s = new THREE.Mesh(box, new THREE.MeshBasicMaterial({ color: 0x8a96b0, transparent: true, opacity: 0.9 }));
+      s.scale.setScalar(0.2);
       s.position.copy(at);
-      const a = Math.random() * Math.PI * 2;
-      s.userData = { from: at.clone(), dest: at.clone().add(new THREE.Vector3(Math.cos(a) * 9, Math.random() * 6, Math.sin(a) * 9)), t: 0, dur: 0.9, inward: false };
+      const a = rand() * Math.PI * 2;
+      s.userData = { from: at.clone(), dest: at.clone().add(new THREE.Vector3(Math.cos(a) * 9, rand() * 6, Math.sin(a) * 9)), t: 0, dur: 0.9, inward: false };
       city.add(s);
       shards.push(s);
     }
   }
-  for (const m of [...tw.layers, tw.cap]) pickables.splice(pickables.indexOf(m), 1);
+  tw.group.traverse((m) => { const i = pickables.indexOf(m); if (i >= 0) pickables.splice(i, 1); });
   dispose(tw.group, city);
 }
-function dispose(o, parent) {
-  parent.remove(o);
-  o.traverse((x) => { if (x.material) { if (x.material.map) x.material.map.dispose(); x.material.dispose(); } });
+
+// Billboards: a commit's headline flashes on a tall building's face.
+const billboards = [];
+function billboard(e) {
+  if (reduced || !e.headline) return;
+  const tall = [...dirs.values()].flatMap((d) => [...d.files.values()]).filter((t) => t.top > 4);
+  if (!tall.length) return;
+  const tw = tall[Math.floor(rand() * tall.length)];
+  const color = '#' + NEON[Math.floor(rand() * NEON.length)].toString(16).padStart(6, '0');
+  const b = new THREE.Mesh(new THREE.PlaneGeometry(5, 0.7), new THREE.MeshBasicMaterial({ map: label(e.headline, color, false), transparent: true, depthWrite: false, side: THREE.DoubleSide }));
+  const out = new THREE.Vector3(tw.group.position.x, 0, tw.group.position.z).normalize();
+  if (!isFinite(out.x)) out.set(0, 0, 1);
+  b.position.copy(tw.group.position).addScaledVector(out, 1.3).setY(tw.top * (0.5 + rand() * 0.4));
+  b.lookAt(b.position.clone().add(out));
+  b.userData = { born: performance.now() };
+  city.add(b);
+  billboards.push(b);
+  while (billboards.length > 14) dispose(billboards.shift(), city);
+}
+
+// ---------- the life: traffic and rain ----------
+const CARS = reduced ? 40 : 150;
+const cars = new THREE.InstancedMesh(new THREE.BoxGeometry(0.35, 0.12, 0.8), new THREE.MeshBasicMaterial(), CARS);
+scene.add(cars);
+const car = Array.from({ length: CARS }, () => ({}));
+function seedCars() {
+  car.forEach((c, i) => {
+    Object.assign(c, { f: rand(), h: 4 + rand() * 24, a: rand() * Math.PI * 2, w: (0.04 + rand() * 0.1) * (rand() < 0.5 ? 1 : -1), lane: (rand() < 0.5 ? -1 : 1) * (2 + rand() * 7), u: rand(), v: 0.12 + rand() * 0.2 });
+    cars.setColorAt(i, _c.setHex(i % 3 === 0 ? 0xff3355 : i % 3 === 1 ? 0xffffff : NEON[i % NEON.length]));
+  });
+  cars.instanceColor.needsUpdate = true;
+}
+function stepCars(dt, inverted) {
+  for (let i = 0; i < CARS; i++) {
+    const c = car[i];
+    if (inverted) { // down the avenue, toward the camera: traffic running backward
+      c.u = (c.u - c.v * dt * 0.25 + 1) % 1;
+      _o.position.set(c.lane, 3 + c.h * 0.45, camera.position.z + 10 - c.u * 170);
+      _o.rotation.set(0, 0, 0);
+    } else { // sky lanes around the city
+      c.a += c.w * dt;
+      const R = 12 + c.f * (extent + 30);
+      _o.position.set(Math.cos(c.a) * R, c.h, Math.sin(c.a) * R);
+      _o.rotation.set(0, -c.a + (c.w > 0 ? 0 : Math.PI), 0);
+    }
+    _o.scale.set(1, 1, 1);
+    _o.updateMatrix();
+    cars.setMatrixAt(i, _o.matrix);
+  }
+  cars.instanceMatrix.needsUpdate = true;
+}
+const DROPS = reduced ? 600 : 3000;
+const rainPos = new Float32Array(DROPS * 6), drop = new Float32Array(DROPS * 3);
+const rain = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x9fb4ff, transparent: true, opacity: 0.32 }));
+rain.geometry.setAttribute('position', new THREE.BufferAttribute(rainPos, 3));
+rain.frustumCulled = false;
+scene.add(rain);
+for (let i = 0; i < DROPS; i++) { drop[i * 3] = (rand() - 0.5) * 140; drop[i * 3 + 1] = rand() * 60; drop[i * 3 + 2] = (rand() - 0.5) * 140; }
+function stepRain(dt, up) {
+  const fx = controls.enabled ? controls.target.x : camera.position.x, fz = controls.enabled ? controls.target.z : camera.position.z - 40;
+  const vy = (up ? 32 : -38) * dt;
+  for (let i = 0; i < DROPS; i++) {
+    let y = drop[i * 3 + 1] + vy;
+    if (y < 0) y += 60; else if (y > 60) y -= 60;
+    drop[i * 3 + 1] = y;
+    const x = fx + drop[i * 3], z = fz + drop[i * 3 + 2], j = i * 6;
+    rainPos[j] = x; rainPos[j + 1] = y; rainPos[j + 2] = z;
+    rainPos[j + 3] = x + 0.04; rainPos[j + 4] = y + 0.75; rainPos[j + 5] = z;
+  }
+  rain.geometry.attributes.position.needsUpdate = true;
 }
 
 // ---------- code sheets: the code itself, painted ----------
 // Inverted, a commit's diff is shown mirrored and un-writes itself (its added
-// lines erase, its removed lines come back), then recedes down the tunnel to its
-// ring. Forward, each rebuilt file is painted (context fades in, the lines the
-// patch added type themselves out), then the sheet folds into its tower: the code
-// layered into the city. Under a backlog only a sample is painted. The text is
-// the repository's, so it only ever reaches a canvas.
+// lines erase, its removed lines come back), then recedes down the avenue to its
+// arch. Forward, each rebuilt file is painted (context fades in, the lines the
+// patch added type themselves out), then the sheet folds into its building's
+// roof. Under a backlog only a sample is painted. The text is the repository's,
+// so it only ever reaches a canvas.
 const SW = 1024, SH = 560, LH = 30;
 const sheetGeo = new THREE.PlaneGeometry(7.2, 7.2 * SH / SW);
 const sheets = [];
@@ -232,7 +496,7 @@ function makeSheet(kind, e, dur) {
   c.width = SW; c.height = SH;
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
-  const m = new THREE.Mesh(sheetGeo, new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide }));
+  const m = new THREE.Mesh(sheetGeo, new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide, toneMapped: false }));
   m.userData = { kind, e, g: c.getContext('2d'), tex, t: 0, dur, state: 'paint', order: [...(e.added || [])].sort((a, b) => a - b) };
   return m;
 }
@@ -242,14 +506,14 @@ function paintSheet(u, p) {
   g.setTransform(1, 0, 0, 1, 0, 0);
   g.clearRect(0, 0, SW, SH);
   if (inv) { g.translate(SW, 0); g.scale(-1, 1); } // read from the other side of the turnstile
-  g.fillStyle = inv ? 'rgba(28, 6, 8, 0.86)' : 'rgba(6, 10, 22, 0.86)';
+  g.fillStyle = inv ? 'rgba(24, 4, 10, 0.88)' : 'rgba(4, 8, 20, 0.88)';
   g.fillRect(0, 0, SW, SH);
-  g.strokeStyle = inv ? 'rgba(255, 59, 59, 0.7)' : e.status === 'exact' ? 'rgba(61, 139, 255, 0.8)' : 'rgba(255, 181, 71, 0.8)';
+  g.strokeStyle = inv ? 'rgba(255, 59, 90, 0.8)' : e.status === 'exact' ? 'rgba(34, 229, 255, 0.85)' : 'rgba(255, 181, 71, 0.85)';
   g.lineWidth = 3;
   g.strokeRect(1.5, 1.5, SW - 3, SH - 3);
   g.font = '20px ui-monospace, Menlo, monospace';
   g.textBaseline = 'middle';
-  g.fillStyle = inv ? '#ff8a8a' : '#9cc3ff';
+  g.fillStyle = inv ? '#ff8aa0' : '#8eeeff';
   g.fillText(`${inv ? '◂ ' + (e.sha || '').slice(0, 8) : '▸ ' + e.status}  ${e.path || ''}`.slice(0, 84), 18, 26);
   g.font = '22px ui-monospace, Menlo, monospace';
   const lines = inv ? e.diff : e.code;
@@ -260,7 +524,7 @@ function paintSheet(u, p) {
       // running backward: what the commit added is erased, what it removed returns
       const f = mark === '+' ? 1 - p : mark === '-' ? p : 1;
       const shown = text.slice(0, Math.round(text.length * f));
-      g.fillStyle = mark === '+' ? '#ff6b6b' : mark === '-' ? '#ffd6d6' : 'rgba(255, 160, 160, 0.45)';
+      g.fillStyle = mark === '+' ? '#ff6b8a' : mark === '-' ? '#ffd6de' : 'rgba(255, 160, 175, 0.45)';
       g.fillText(`${mark} ${shown}`, 18, y);
       if (mark !== ' ' && f > 0 && f < 1) g.fillRect(18 + g.measureText(`${mark} ${shown}`).width + 2, y - 11, 12, 22);
       continue;
@@ -278,17 +542,17 @@ function paintSheet(u, p) {
     const f = clamp01((p - start) / (0.72 / n + 0.06));
     if (f <= 0) continue;
     const shown = lines[i].slice(0, Math.round(lines[i].length * f));
-    g.fillStyle = 'rgba(61, 139, 255, 0.16)';
+    g.fillStyle = 'rgba(34, 229, 255, 0.16)';
     g.fillRect(78, y - 14, Math.max(8, g.measureText(shown).width + 12), 28);
-    g.fillStyle = '#e3eeff';
+    g.fillStyle = '#e3f9ff';
     g.fillText(shown, 84, y);
-    if (f < 1) { g.fillStyle = '#3d8bff'; g.fillRect(84 + g.measureText(shown).width + 2, y - 11, 12, 22); }
+    if (f < 1) { g.fillStyle = '#22e5ff'; g.fillRect(84 + g.measureText(shown).width + 2, y - 11, 12, 22); }
   }
   u.tex.needsUpdate = true;
 }
-// Both kinds are painted large before the camera. (Hung in the tunnel instead,
-// the inverted sheets sat far ahead of a camera that trails a backlog, too small
-// to read: seen live, google/uuid.)
+// Both kinds are painted large before the camera. (Hung far ahead instead, the
+// inverted sheets sat beyond a camera that trails a backlog, too small to read:
+// seen live, google/uuid.)
 function newSheet(kind, e, dur) {
   const busy = sheets.find((s) => s.userData.kind === kind && s.userData.state === 'paint');
   if (busy && busy.userData.t < 0.45) return null; // under a backlog, paint a sample, not every change
@@ -302,7 +566,7 @@ function newSheet(kind, e, dur) {
 }
 function invSheet(e) {
   const s = newSheet('inv', e, Math.max(0.4, Math.min(1.5, 1.5 - queue.length / 150)));
-  if (s) s.userData.to = new THREE.Vector3((e.i % 2 ? -1 : 1) * 2.5, (e.i % 3 - 1) * 1.2, -depth);
+  if (s) s.userData.to = new THREE.Vector3((e.i % 2 ? -1 : 1) * 4, 9.3, -depth);
 }
 function fwdSheet(e) {
   const s = newSheet('fwd', e, Math.max(0.4, Math.min(1.8, 1.8 - queue.length / 120)));
@@ -317,7 +581,7 @@ function placeBeforeCamera(s) { // forward sheets to the left, inverted to the r
   s.position.copy(camera.position).addScaledVector(_v, 9).addScaledVector(_r, side).addScaledVector(camera.up, s.userData.kind === 'inv' ? -0.6 : 1.1);
   s.quaternion.copy(camera.quaternion);
 }
-function fold(s) { // paint it whole, then send it into its tower, or down the tunnel
+function fold(s) { // paint it whole, then send it to its building's roof, or down the avenue
   const u = s.userData;
   paintSheet(u, 1);
   u.state = 'fold';
@@ -341,7 +605,7 @@ function stepSheets(dt) {
     } else if (u.state === 'fold') {
       u.t = Math.min(1, u.t + dt / (u.kind === 'inv' ? 1.1 : 0.8));
       const tw = u.tower && u.tower.group.parent ? u.tower : null;
-      const to = u.kind === 'inv' ? u.to : tw ? _v.copy(tw.group.position).setY(tw.top + 0.3) : u.from;
+      const to = u.kind === 'inv' ? u.to : tw ? _v.copy(tw.group.position).setY(tw.top + 0.5) : u.from;
       s.position.lerpVectors(u.from, to, ease(u.t));
       s.scale.setScalar(1 - 0.94 * ease(u.t));
       s.material.opacity = 0.96 * (1 - u.t * u.t);
@@ -372,6 +636,17 @@ function say(text, err) { const m = $('msg'); m.textContent = text; m.className 
 
 // ---------- the event queue ----------
 let queue = [], holdUntil = 0, phase = 'idle', clock = 0;
+function enterForward() {
+  phase = 'fwd';
+  setPhase('forward', 'fwd');
+  skyMood = SKY.fwd;
+  avenue.visible = false;
+  city.visible = true;
+  camera.position.set(34, 26, 40);
+  controls.target.set(0, 4, 0);
+  controls.enabled = true;
+  viewerMoved = false;
+}
 function handle(e) {
   switch (e.t) {
     case 'meta':
@@ -384,22 +659,17 @@ function handle(e) {
       tick(`◂ ${e.sha.slice(0, 8)} ${e.headline || ''}`, 'inv');
       break;
     case 'turnstile':
-      turnstile.position.set(0, 0, -depth - 6);
+      turnstile.position.set(0, 4.5, -depth - 8);
       turnstile.visible = true;
       setPhase(e.root ? 'turnstile · root reached' : 'turnstile · window edge', 'inv');
       holdUntil = performance.now() + (reduced ? 300 : 2200);
       flyThrough = { t0: performance.now(), from: camera.position.clone() };
       break;
     case 'commit':
-      if (phase !== 'fwd') {
-        phase = 'fwd';
-        setPhase('forward', 'fwd');
-        entropy = 1;
-        pMat.color.copy(BLUE);
-        scene.fog.density = 0.008;
-      }
+      if (phase !== 'fwd') enterForward();
       clock = e.i;
       commitNow = { sha: e.sha, headline: e.headline || '', author: e.author || '', date: (e.date || '').slice(0, 10) };
+      if (e.i % 5 === 0) billboard(e);
       tick(`▸ ${e.sha.slice(0, 8)} ${e.headline || ''}`, 'fwd');
       break;
     case 'file':
@@ -426,10 +696,11 @@ function handle(e) {
 function showSummary(s) {
   const pct = s.head_files ? Math.round((100 * s.head_exact) / s.head_files) : 0;
   $('sum-title').textContent = s.mismatch ? 'Reconstruction · mismatches found' : 'Reconstruction proven';
-  $('sum-line').textContent = `${s.head_exact} of ${s.head_files} files at the head rebuilt byte-exact from diffs alone (${pct}%).`;
+  $('sum-line').textContent = `${s.head_exact} of ${s.head_files} files at the head rebuilt byte-exact (${pct}%).`;
   const rows = [
     ['commits walked', s.commits], ['root reached', s.root_reached ? 'yes' : 'no (window edge)'],
-    ['file versions built', s.file_versions], ['proven exact', s.exact], ['unproven', s.unknown], ['mismatch', s.mismatch],
+    ['file versions built', s.file_versions], ['proven exact', s.exact], ['  of them from a fetched blob', s.fetched],
+    ['unproven', s.unknown], ['mismatch', s.mismatch],
     ['head files unproven', s.head_unknown], ['head files never built', s.head_missing],
     ['GitHub calls', s.api_calls], ['from the database', s.cache_hits], ['time', (s.millis / 1000).toFixed(1) + ' s'],
   ];
@@ -440,7 +711,7 @@ function showSummary(s) {
     const dd = document.createElement('dd'); dd.textContent = v;
     grid.append(dt, dd);
   }
-  $('sum-fine').textContent = 'Each file version is checked against the blob id GitHub reports for it; the final tree against the head commit. Unproven means the content was never streamed (a binary, a truncated patch, or a file older than the window), never guessed.';
+  $('sum-fine').textContent = 'Each file version is checked against the blob id GitHub reports for it; the final tree against the head commit. Where GitHub sends no patch (a binary, a very large diff), the blob is fetched by that id and proven by its hash. Unproven means the content was never streamed, never guessed.';
   $('summary').hidden = false;
   $('summary').onclick = () => { $('summary').hidden = true; }; // out of the way of the city
   $('go').disabled = false;
@@ -458,17 +729,21 @@ function connect() {
   };
 }
 
-function reset() {
-  for (const g of [tunnel, city]) while (g.children.length) dispose(g.children[0], g);
+// reset clears the stage and grows a new world from the repository's name.
+function reset(repo) {
+  for (const g of [arches, city]) while (g.children.length) dispose(g.children[0], g);
+  city.add(streets);
   for (const s of [...sheets]) retire(s);
-  dirs.clear(); shards.length = 0; pickables.length = 0; queue = []; received = 0; depth = 0; clock = 0; extent = 6;
+  dirs.clear(); shards.length = 0; pickables.length = 0; billboards.length = 0;
+  queue = []; received = 0; depth = 0; clock = 0; extent = 10; nextCell = 0;
   commitNow = null; runDone = false; hover = null; tip.hidden = true; closeFile();
-  Object.assign(view, { theta: 0.8, phi: 1.0, zoomed: false });
+  rand = mulberry32(hashStr(repo));
+  noise = createNoise2D(mulberry32(hashStr(repo) ^ 0x9e3779b9));
+  buildSkyline(); seedCars();
   Object.keys(stats).forEach((k) => (stats[k] = 0));
-  phase = 'inv'; entropy = -1; turnstile.visible = false; flyThrough = null;
-  pMat.color.copy(RED); scene.fog.density = 0.012;
-  camera.position.set(0, 0, 12); camera.lookAt(0, 0, 0);
-  for (let i = 0; i < N; i++) seedParticle(i, true);
+  phase = 'inv'; skyMood = SKY.inv; turnstile.visible = false; flyThrough = null;
+  avenue.visible = true; city.visible = false; controls.enabled = false;
+  camera.position.set(0, 3.2, 12); camera.lookAt(0, 3.2, -20);
   $('ticker').replaceChildren();
   $('summary').hidden = true;
   $('stats').hidden = false;
@@ -486,7 +761,7 @@ $('query').addEventListener('submit', async (ev) => {
     const body = await r.json();
     if (!r.ok) throw new Error(body.error ? body.error.message : r.statusText);
     if (ws) { sessionId = null; ws.close(1000); }
-    reset();
+    reset(repo.toLowerCase());
     sessionId = body.id;
     connect();
   } catch (err) {
@@ -495,79 +770,93 @@ $('query').addEventListener('submit', async (ev) => {
   }
 });
 
-// ---------- the viewer's hands: turn, zoom, hover, open ----------
-const view = { theta: 0.8, phi: 1.0, r: 30, zoomed: false, target: new THREE.Vector3(0, 1.5, 0) };
-let hover = null, runDone = false, drag = null;
-const canvas = $('scene'), tip = $('tip');
+// ---------- the viewer's hands: hover, open ----------
+// The roof opens the file's current copy; a floor band opens that change's diff.
+let hover = null, runDone = false, press = null;
+const tip = $('tip');
 const raycaster = new THREE.Raycaster(), ndc = new THREE.Vector2();
-canvas.addEventListener('contextmenu', (ev) => ev.preventDefault()); // right button turns the camera
-canvas.addEventListener('pointerdown', (ev) => {
-  drag = { x: ev.clientX, y: ev.clientY, button: ev.button, moved: 0 };
-  canvas.setPointerCapture(ev.pointerId);
-});
-canvas.addEventListener('pointermove', (ev) => {
-  if (drag) {
-    const dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
-    drag.moved += Math.abs(dx) + Math.abs(dy);
-    drag.x = ev.clientX; drag.y = ev.clientY;
-    if (drag.button === 2 && phase === 'fwd') {
-      view.theta -= dx * 0.006;
-      view.phi = Math.min(1.45, Math.max(0.15, view.phi - dy * 0.006));
-    }
-  }
-  pick(ev.clientX, ev.clientY);
-});
+canvas.addEventListener('contextmenu', (ev) => ev.preventDefault()); // the right button orbits
+canvas.addEventListener('pointerdown', (ev) => { if (ev.button === 0) press = { x: ev.clientX, y: ev.clientY }; });
+canvas.addEventListener('pointermove', (ev) => pick(ev.clientX, ev.clientY, ev.buttons & 2));
 canvas.addEventListener('pointerup', (ev) => {
-  if (drag && drag.button === 0 && drag.moved < 5 && hover) openFile(hover.tower);
-  drag = null;
+  if (ev.button === 0 && press && Math.hypot(ev.clientX - press.x, ev.clientY - press.y) < 5 && hover) {
+    if (hover.layer) openDiff(hover.tower, hover.layer); else openFile(hover.tower);
+  }
+  press = null;
 });
 canvas.addEventListener('pointerleave', () => { hover = null; tip.hidden = true; });
-canvas.addEventListener('wheel', (ev) => {
-  if (phase !== 'fwd') return;
-  ev.preventDefault();
-  view.r = Math.min(400, Math.max(4, view.r * Math.exp(ev.deltaY * 0.001)));
-  view.zoomed = true;
-}, { passive: false });
 
-// pick finds the layer or cap under the pointer and fills the tooltip.
-function pick(x, y) {
-  if (phase !== 'fwd' || (drag && drag.button === 2)) { hover = null; tip.hidden = true; return; }
+// pick finds the floor band or roof under the pointer and fills the tooltip.
+function pick(x, y, turning) {
+  if (phase !== 'fwd' || turning) { hover = null; tip.hidden = true; return; }
   ndc.set((x / innerWidth) * 2 - 1, -(y / innerHeight) * 2 + 1);
   raycaster.setFromCamera(ndc, camera);
   const hit = raycaster.intersectObjects(pickables, false)[0];
   if (!hit) { hover = null; tip.hidden = true; canvas.style.cursor = ''; return; }
   const u = hit.object.userData, tw = u.tower;
-  hover = { tower: tw, layer: u.commit !== undefined ? hit.object : null };
+  const layer = u.cap ? null : tw.layers.find((l) => l.userData === u) || null;
+  hover = { tower: tw, layer };
   const status = { exact: 'proven exact', unknown: 'unproven', mismatch: 'mismatch' }[tw.status] || tw.status;
   const rows = [tw.path, `${status} · ${tw.lines} lines · ${tw.versions} versions${tw.dropped ? ` (${tw.dropped} oldest not drawn)` : ''}`];
-  if (hover.layer && u.commit) rows.push(`${u.commit.sha.slice(0, 8)} ${u.commit.date} ${u.commit.author}`, u.commit.headline, `+${u.adds} −${u.dels} lines`);
-  rows.push('click to open the file');
+  if (layer && u.commit) rows.push(`${u.commit.sha.slice(0, 8)} ${u.commit.date} ${u.commit.author}`, u.commit.headline, `+${u.adds} −${u.dels} lines`, 'click to see this change');
+  else rows.push('roof: click to open the current copy');
   tip.replaceChildren(...rows.map((r, i) => { const d = document.createElement('div'); d.textContent = r; if (i === 0) d.className = 'path'; return d; }));
   tip.style.left = `${Math.min(x + 16, innerWidth - 340)}px`;
-  tip.style.top = `${Math.min(y + 16, innerHeight - 140)}px`;
+  tip.style.top = `${Math.min(y + 16, innerHeight - 150)}px`;
   tip.hidden = false;
   canvas.style.cursor = 'pointer';
 }
 
-// openFile shows a rebuilt file, from the session, once the run is done.
-async function openFile(tw) {
-  const panel = $('file');
-  $('f-path').textContent = tw.path;
-  $('f-code').textContent = '';
-  panel.hidden = false;
+function showPanel(title, meta) {
+  $('f-path').textContent = title;
+  $('f-meta').textContent = meta;
+  $('f-code').replaceChildren();
+  $('file').hidden = false;
   document.body.classList.add('filing');
-  if (!runDone) { $('f-meta').textContent = 'the files open when the reconstruction is done'; return; }
-  $('f-meta').textContent = 'opening…';
+}
+async function getJSON(url) {
+  const r = await fetch(url);
+  const b = await r.json();
+  if (!r.ok) throw new Error(b.error ? b.error.message : r.statusText);
+  return b;
+}
+// openFile shows the file's current copy as the run rebuilt it, once the run is done.
+async function openFile(tw) {
+  showPanel(tw.path, runDone ? 'opening…' : 'the files open when the reconstruction is done');
+  if (!runDone) return;
   try {
-    const r = await fetch(`/api/v1/reconstructions/${sessionId}/file?path=${encodeURIComponent(tw.path)}`);
-    const f = await r.json();
-    if (!r.ok) throw new Error(f.error ? f.error.message : r.statusText);
-    if (!f.known) { $('f-meta').textContent = `unproven: the rebuilt history never held this file's content (${tw.status})`; return; }
-    if (f.binary) { $('f-meta').textContent = `${f.bytes} bytes, binary`; return; }
+    const f = await getJSON(`/api/v1/reconstructions/${sessionId}/file?path=${encodeURIComponent(tw.path)}`);
+    if (!f.known) { $('f-meta').textContent = `unproven: ${f.why || 'the run never held this file\'s content'}`; return; }
+    if (f.binary) { $('f-meta').textContent = `${f.bytes} bytes, binary · proven by its blob id`; return; }
     const lines = f.content.replace(/\n$/, '').split('\n');
     const w = String(lines.length).length;
-    $('f-meta').textContent = `rebuilt from diffs alone and proven against GitHub's blob id · ${lines.length} lines · ${tw.versions} versions${f.truncated ? ' · first 1 MB shown' : ''}`;
+    $('f-meta').textContent = `current copy, rebuilt and proven against GitHub's blob id · ${lines.length} lines · ${tw.versions} versions${f.truncated ? ' · first 1 MB shown' : ''}`;
     $('f-code').textContent = lines.map((l, i) => `${String(i + 1).padStart(w)}  ${l}`).join('\n');
+  } catch (err) {
+    $('f-meta').textContent = err.message;
+  }
+}
+// openDiff shows the change one floor band stands for.
+async function openDiff(tw, layer) {
+  const c = layer.userData.commit;
+  showPanel(`${tw.path} @ ${c.sha.slice(0, 8)}`, 'opening…');
+  try {
+    const d = await getJSON(`/api/v1/reconstructions/${sessionId}/diff?sha=${c.sha}&path=${encodeURIComponent(tw.path)}`);
+    $('f-meta').textContent = `${c.date} ${c.author} · ${d.headline} · ${d.status}${d.from ? ' from ' + d.from : ''} · +${d.additions} −${d.deletions}`;
+    if (!d.patch) {
+      $('f-code').textContent = layer.userData.fetched
+        ? 'GitHub sends no patch for this change (a binary, or a very large diff).\nThe file was proven here by fetching its blob by id.'
+        : 'GitHub sends no patch for this change.';
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (const l of d.patch.split('\n')) {
+      const s = document.createElement('span');
+      s.textContent = l + '\n';
+      s.className = l[0] === '+' ? 'add' : l[0] === '-' ? 'del' : l.startsWith('@@') ? 'hunk' : '';
+      frag.append(s);
+    }
+    $('f-code').replaceChildren(frag);
   } catch (err) {
     $('f-meta').textContent = err.message;
   }
@@ -579,6 +868,7 @@ addEventListener('keydown', (ev) => { if (ev.key === 'Escape') closeFile(); });
 // ---------- the loop ----------
 let flyThrough = null, last = performance.now(), tokens = 0;
 const ease = (t) => 1 - Math.pow(1 - t, 3);
+const want = new THREE.Vector3();
 function frame(now) {
   const dt = Math.min(0.05, (now - last) / 1000);
   last = now;
@@ -592,75 +882,64 @@ function frame(now) {
     tokens = 0;
   }
 
-  // camera
-  if (phase === 'inv' && !flyThrough) {
-    const targetZ = 12 - depth;
-    camera.position.z += (targetZ - camera.position.z) * Math.min(1, dt * 2.5);
-    camera.position.x = Math.sin(now / 2400) * 0.6;
-    camera.lookAt(0, 0, camera.position.z - 20);
+  const inverted = phase !== 'fwd';
+  if (inverted && !flyThrough) { // run down the avenue, a little behind the newest arch
+    const z = 14 - depth;
+    camera.position.z += (z - camera.position.z) * Math.min(1, dt * 2.5);
+    camera.position.x = Math.sin(now / 2600) * 0.8;
+    camera.position.y = 3.2;
+    camera.lookAt(0, 4, camera.position.z - 30);
   } else if (flyThrough) {
     const t = Math.min(1, (now - flyThrough.t0) / (reduced ? 300 : 2200));
     camera.position.z = flyThrough.from.z + (turnstile.position.z - 4 - flyThrough.from.z) * ease(t);
-    camera.lookAt(0, 0, camera.position.z - 20);
+    camera.lookAt(0, 4.5, camera.position.z - 20);
     turnstile.rotation.z += dt * (1 + t * 10);
     if (t > 0.72 && !flyThrough.flashed) {
       flyThrough.flashed = true;
       const f = $('flash'); f.classList.add('on');
       requestAnimationFrame(() => requestAnimationFrame(() => f.classList.remove('on')));
-      tunnel.visible = false; turnstile.visible = false;
-    }
-    if (t >= 1) {
-      flyThrough = null; tunnel.visible = true;
-      while (tunnel.children.length) dispose(tunnel.children[0], tunnel);
+      turnstile.visible = false;
       for (const s of sheets.filter((x) => x.userData.kind === 'inv')) retire(s);
     }
-  } else if (phase === 'fwd') {
-    // The camera holds still: right-drag turns it, the wheel zooms. Until the
-    // viewer zooms, its distance follows the city so all of it stays in view.
-    if (!view.zoomed) view.r = 10 + extent * 1.35;
-    const want = new THREE.Vector3().setFromSphericalCoords(view.r, view.phi, view.theta).add(view.target);
-    camera.position.lerp(want, Math.min(1, dt * 4));
-    camera.lookAt(view.target);
-  }
-
-  // tunnel rings spin; the newest glow
-  for (const o of tunnel.children) if (o.userData.spin) o.rotation.z += o.userData.spin;
-
-  // particles: implode while inverted, explode once time runs forward
-  // vel points at the axis: moving along it implodes, against it explodes
-  const cz = camera.position.z, s = 6 * dt;
-  for (let i = 0; i < N; i++) {
-    const j = i * 3;
-    pos[j] -= vel[j] * s * entropy;
-    pos[j + 1] -= vel[j + 1] * s * entropy;
-    const r2 = pos[j] * pos[j] + pos[j + 1] * pos[j + 1];
-    if (entropy < 0 && (r2 < 1 || pos[j + 2] > cz + 5 || pos[j + 2] < cz - 200)) {
-      seedParticle(i, false); // arrives from the rim, falls inward
-    } else if (entropy > 0 && r2 > 2600) {
-      seedParticle(i, false); // leaves from the core, flies outward
-      pos[j] *= 0.03; pos[j + 1] *= 0.03; pos[j + 2] = (Math.random() - 0.5) * 80;
+    if (t >= 1) flyThrough = null;
+  } else {
+    // Until the viewer turns or zooms, the camera backs off as the city grows.
+    if (!viewerMoved) {
+      want.copy(camera.position).sub(controls.target).setLength(16 + extent * 1.5).add(controls.target);
+      camera.position.lerp(want, Math.min(1, dt * 1.5));
     }
+    controls.update();
   }
-  pGeo.attributes.position.needsUpdate = true;
+  stepWalls();
+  stepSky(dt);
+  stepCars(dt, inverted);
+  stepRain(dt, inverted);
+  neonLights.forEach((l, i) => {
+    const a = now / 4000 + (i * Math.PI * 2) / 3, R = inverted ? 10 : extent * 0.6;
+    l.position.set(Math.cos(a) * R, inverted ? 6 : 12, (inverted ? camera.position.z - 30 : 0) + Math.sin(a) * R);
+  });
 
-  // layers grow to their thickness and settle; a fresh one flashes; the hovered
-  // tower glows
-  const k6 = Math.min(1, dt * 6);
+  // floor bands grow to their height and settle; a fresh one flashes; the
+  // hovered building glows; beacons pulse
+  const k6 = Math.min(1, dt * 6), pulse = 0.75 + 0.25 * Math.sin(now / 300);
   for (const slot of dirs.values()) {
     for (const tw of slot.files.values()) {
-      const lit = hover && hover.tower === tw ? 0.5 : 0;
+      const lit = hover && hover.tower === tw ? 0.6 : 0;
       for (const m of tw.layers) {
         const u = m.userData;
         m.scale.y += (u.th - m.scale.y) * k6;
         m.position.y += (u.y - m.position.y) * k6;
+        u.line.position.y = m.position.y + m.scale.y / 2;
         u.flash = Math.max(0, u.flash - dt * 1.5);
-        m.material.emissiveIntensity = 0.45 + lit + u.flash * 1.8 + (hover && hover.layer === m ? 0.8 : 0);
+        m.material.emissiveIntensity = 1.1 + lit + u.flash * 2 + (hover && hover.layer === m ? 1.2 : 0);
       }
-      tw.cap.position.y += (tw.top + 0.045 - tw.cap.position.y) * k6;
+      tw.cap.position.y += (tw.top + 0.11 - tw.cap.position.y) * k6;
+      tw.beacon.scale.setScalar(pulse + (hover && hover.tower === tw && !hover.layer ? 0.5 : 0));
     }
   }
+  for (const b of billboards) b.material.opacity = 0.75 + 0.25 * Math.sin((now - b.userData.born) / 90) * Math.sin(now / 1700);
 
-  // shards: inward ones converge on their layer (un-shattering), outward ones fly off
+  // motes: inward ones converge on their band, outward ones fly off
   for (let k = shards.length - 1; k >= 0; k--) {
     const s = shards[k], u = s.userData;
     u.t += dt / u.dur;
@@ -677,9 +956,14 @@ function frame(now) {
   const c = Math.abs(clock);
   $('clock').textContent = `${clock < 0 ? '−' : ' '}${String(Math.floor(c / 60)).padStart(2, '0')}:${String(c % 60).padStart(2, '0')}`;
 
-  renderer.render(scene, camera);
+  composer.render();
   requestAnimationFrame(frame);
 }
+
+// The stage before any run: the seeded skyline, the avenue, the rain.
+buildSkyline(); seedCars();
+city.visible = false;
+camera.lookAt(0, 3.2, -20);
 requestAnimationFrame(frame);
 
 const fromURL = new URLSearchParams(location.search).get('repo');

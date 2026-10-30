@@ -40,8 +40,8 @@ dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
 .blue { color: var(--blue); } .amber { color: var(--amber); } .red { color: var(--red); }
 .legend { margin-top: 8px; font-size: 10px; color: var(--dim); }
 .legend i { display: inline-block; width: 8px; height: 8px; margin: 0 4px 0 8px; vertical-align: middle; }
-.legend i.added { background: var(--blue); } .legend i.removed { background: var(--red); }
-.legend i.cap-exact { background: #eef4ff; } .legend i.amber { background: var(--amber); } .legend i.cap-mismatch { background: #ff2bd6; }
+.legend i.added { background: #22e5ff; } .legend i.removed { background: #ff2bd6; }
+.legend i.cap-exact { background: #3dff8a; } .legend i.amber { background: var(--amber); } .legend i.cap-mismatch { background: var(--red); }
 .legend.hint { opacity: .75; }
 
 /* The tooltip over a tower, and the file a click opens. */
@@ -55,6 +55,7 @@ dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
 .file header button { border: 1px solid var(--line); background: transparent; color: var(--dim); font: 12px var(--mono); padding: 2px 8px; cursor: pointer; }
 .file .fine { margin: 0; font-size: 11px; color: var(--dim); }
 #f-code { flex: 1; margin: 0; overflow: auto; font: 12px/1.5 var(--mono); color: #cfdcf2; white-space: pre; tab-size: 4; }
+#f-code .add { color: #22e5ff; } #f-code .del { color: #ff2bd6; } #f-code .hunk { color: var(--dim); }
 body.filing .hud-left { display: none; }
 .card { cursor: pointer; }
 

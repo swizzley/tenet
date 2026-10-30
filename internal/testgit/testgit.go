@@ -5,6 +5,7 @@
 package testgit
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -160,6 +161,7 @@ type Server struct {
 	R            *Repo
 	Calls        atomic.Int64
 	GraphQLCalls atomic.Int64
+	BlobCalls    atomic.Int64
 	InFlight     atomic.Int64
 	MaxSeen      atomic.Int64
 	// Tamper, when set, may change a commit's files before they are served.
@@ -212,6 +214,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		json.NewEncoder(w).Encode(out)
 	case strings.HasPrefix(p, "/commits/"):
 		json.NewEncoder(w).Encode(s.commit(strings.TrimPrefix(p, "/commits/")))
+	case strings.HasPrefix(p, "/git/blobs/"):
+		s.BlobCalls.Add(1)
+		b := g("cat-file", "blob", strings.TrimPrefix(p, "/git/blobs/"))
+		json.NewEncoder(w).Encode(map[string]any{"content": base64.StdEncoding.EncodeToString([]byte(b)), "encoding": "base64", "size": len(b)})
 	case strings.HasPrefix(p, "/git/trees/"):
 		var tree []map[string]string
 		for _, l := range strings.Split(strings.TrimSpace(g("ls-tree", "-r", strings.TrimPrefix(p, "/git/trees/"))), "\n") {
@@ -319,7 +325,9 @@ func (s *Server) commit(sha string) map[string]any {
 				file["sha"] = nil // a mode-only change: GitHub sends no blob id
 			}
 		} else {
-			file["changes"] = 1 // binary: GitHub sends no patch
+			// binary: GitHub sends no patch and counts no changes (VERIFIED live
+			// 2026-10-30: tensorwire/mongoose's added binaries)
+			file["additions"], file["deletions"], file["changes"] = 0, 0, 0
 		}
 		files = append(files, file)
 	}

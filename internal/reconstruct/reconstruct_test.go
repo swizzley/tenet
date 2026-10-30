@@ -69,9 +69,12 @@ func TestFullHistoryRebuildsHeadExactly(t *testing.T) {
 	if sum.Mismatch != 0 || sum.HeadMissing != 0 || sum.Extra != 0 {
 		t.Fatalf("summary %+v", sum)
 	}
+	// Every head file is proven, the binary too: GitHub sends no patch for it,
+	// so its blob is fetched by id and proven by its hash.
 	headFiles := len(strings.Fields(g.repo.Git("ls-tree", "-r", "--name-only", "main")))
-	if sum.HeadFiles != headFiles || sum.HeadExact != headFiles-1 || sum.HeadUnknown != 1 {
-		t.Fatalf("head: %d files, %d exact, %d unknown; want %d, %d, 1 (the binary)", sum.HeadFiles, sum.HeadExact, sum.HeadUnknown, headFiles, headFiles-1)
+	if sum.HeadFiles != headFiles || sum.HeadExact != headFiles || sum.HeadUnknown != 0 || sum.Fetched < 1 {
+		t.Fatalf("head: %d files, %d exact, %d unknown, %d fetched; want %d exact, 0 unknown, the binary fetched",
+			sum.HeadFiles, sum.HeadExact, sum.HeadUnknown, sum.Fetched, headFiles)
 	}
 	// The code the page paints is the rebuilt file itself: each line equals git's
 	// content of that file at that commit, at that line number.
@@ -119,11 +122,11 @@ func TestFullHistoryRebuildsHeadExactly(t *testing.T) {
 	}
 	modeOnly := 0
 	for _, e := range rec.of("file") {
-		if e.Status == "unknown" && e.Path != "logo.bin" {
-			t.Fatalf("unproven %s: %s", e.Path, e.Why)
+		if e.Status != "exact" && e.Status != "deleted" {
+			t.Fatalf("%s %s: %s", e.Status, e.Path, e.Why)
 		}
-		if e.Path == "logo.bin" && e.Status != "unknown" {
-			t.Fatalf("binary reported %s", e.Status)
+		if e.Path == "logo.bin" && !e.Fetched {
+			t.Fatalf("the binary was proven without its blob: %+v", e)
 		}
 		if e.Why == "mode change only; content unchanged" {
 			modeOnly++
@@ -260,12 +263,22 @@ func TestTamperedPatchIsCaught(t *testing.T) {
 		}
 	}
 	var rec recorder
-	sum, err := g.runner.Run(context.Background(), "o", "r", 1000, rec.emit)
+	sum, files, err := g.runner.RunFiles(context.Background(), "o", "r", 1000, rec.emit)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if target == "" {
 		t.Fatal("the tamper hook never fired, so this test proved nothing")
+	}
+	// A file left unproven says why, for the page's file view.
+	whys := 0
+	for _, f := range files {
+		if !f.Known && f.Why != "" {
+			whys++
+		}
+	}
+	if whys == 0 {
+		t.Fatal("no unproven file carries its reason")
 	}
 	if sum.Mismatch == 0 {
 		t.Fatalf("a tampered patch went unnoticed: %+v", sum)
@@ -282,6 +295,48 @@ func TestTamperedPatchIsCaught(t *testing.T) {
 			t.Fatalf("%s: unproven after a mismatch, but the reason given is %q", e.Path, e.Why)
 		}
 	}
+}
+
+// GitHub sends no patch for a very large diff. The version is proven by its
+// blob, fetched by id, and the file's later versions build on it: one withheld
+// patch left every later version unproven (live, tensorwire/mongoose).
+func TestWithheldPatchIsFetchedAndHistoryContinues(t *testing.T) {
+	g := newRig(t, 40, 8)
+	// An early change to README.md, one that later changes build on (git lists
+	// newest first; the last entry is the file's creation).
+	changes := strings.Fields(g.repo.Git("log", "--first-parent", "--format=%H", "main", "--", "README.md"))
+	if len(changes) < 4 {
+		t.Fatalf("README.md changes %d times; the test needs later ones", len(changes))
+	}
+	target, stripped := changes[len(changes)-2], ""
+	g.srv.Tamper = func(sha string, files []map[string]any) {
+		for _, f := range files {
+			if sha == target && f["filename"] == "README.md" && f["status"] == "modified" {
+				stripped = "README.md"
+				delete(f, "patch")
+			}
+		}
+	}
+	var rec recorder
+	sum, err := g.runner.Run(context.Background(), "o", "r", 1000, rec.emit)
+	if err != nil || stripped == "" {
+		t.Fatalf("%v; stripped %q", err, stripped)
+	}
+	after, fetched := 0, false
+	for _, e := range rec.of("file") {
+		if e.Status != "exact" && e.Status != "deleted" {
+			t.Fatalf("%s %s: %s", e.Status, e.Path, e.Why)
+		}
+		if e.Path == stripped && e.Fetched {
+			fetched = true
+		} else if e.Path == stripped && fetched {
+			after++
+		}
+	}
+	if !fetched || after == 0 || sum.HeadExact != sum.HeadFiles || g.srv.BlobCalls.Load() == 0 {
+		t.Fatalf("fetched %v, head %d of %d exact, %d blob calls", fetched, sum.HeadExact, sum.HeadFiles, g.srv.BlobCalls.Load())
+	}
+	t.Logf("%s: patch withheld, blob fetched, %d later versions proven on top of it", stripped, after)
 }
 
 // Detail requests run in chunks no bigger than the rate-limit chunk, and a second
@@ -304,8 +359,8 @@ func TestChunkingAndCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.CacheHits != second.Commits {
-		t.Fatalf("second run: %d of %d from cache", second.CacheHits, second.Commits)
+	if second.CacheHits != second.Commits+second.Fetched {
+		t.Fatalf("second run: %d from cache, want all %d commits and %d blobs", second.CacheHits, second.Commits, second.Fetched)
 	}
 	if extra := g.srv.Calls.Load() - calls; extra > 4 { // repo, branch, list, tree
 		t.Fatalf("second run made %d upstream calls", extra)

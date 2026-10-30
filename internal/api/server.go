@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -51,6 +52,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/reconstructions/{id}", s.reconstructionStatus)
 	mux.HandleFunc("GET /api/v1/reconstructions/{id}/events", s.reconstructionEvents)
 	mux.HandleFunc("GET /api/v1/reconstructions/{id}/file", s.reconstructionFile)
+	mux.HandleFunc("GET /api/v1/reconstructions/{id}/diff", s.reconstructionDiff)
 	mux.Handle("GET /", http.FileServerFS(s.Static))
 	return s.wrap(mux)
 }
@@ -374,6 +376,9 @@ func (s *Server) reconstructionFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := map[string]any{"path": path, "known": f.Known, "bytes": len(f.Content)}
+	if !f.Known {
+		out["why"] = f.Why
+	}
 	if f.Known {
 		c := f.Content[:min(len(f.Content), maxFileView)]
 		out["truncated"] = len(c) < len(f.Content)
@@ -387,6 +392,39 @@ func (s *Server) reconstructionFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, 200, out)
+}
+
+var commitIDRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+// reconstructionDiff returns one file's change in one commit of a run: the
+// layer a viewer clicked. It is read from the commit details the run stored, so
+// it costs no GitHub call.
+func (s *Server) reconstructionDiff(w http.ResponseWriter, r *http.Request) {
+	sess, ok := s.Recon.Get(r.PathValue("id"))
+	if !ok {
+		fail(w, 404, "not_found", "unknown reconstruction id", nil)
+		return
+	}
+	sha, path := r.URL.Query().Get("sha"), r.URL.Query().Get("path")
+	if !commitIDRe.MatchString(sha) || path == "" || len(path) > 1024 {
+		fail(w, 400, "bad_request", "sha must be a 40-character commit id, and path must name a file", nil)
+		return
+	}
+	b, ok, err := s.Svc.Store.Detail(r.Context(), sess.Repo, sha)
+	var c github.Commit
+	if err != nil || !ok || json.Unmarshal(b, &c) != nil {
+		fail(w, 404, "not_found", "this run stored no such commit", nil)
+		return
+	}
+	for _, f := range c.Files {
+		if f.Filename == path {
+			headline, _, _ := strings.Cut(c.Commit.Message, "\n")
+			writeJSON(w, 200, map[string]any{"sha": sha, "path": path, "status": f.Status, "from": f.PreviousFilename,
+				"additions": f.Additions, "deletions": f.Deletions, "patch": f.Patch, "headline": headline})
+			return
+		}
+	}
+	fail(w, 404, "not_found", "that commit does not change that file", nil)
 }
 
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {

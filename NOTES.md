@@ -73,17 +73,19 @@ The Claude path is the same check without the template: with a key, `GET .../nar
 2. **Fetching diffs.** The walker fetches each commit's diff in chunks: as many requests at once as fill one buffer, capped by the rate-limit budget the limiter reads from `X-RateLimit-*` (`Limiter.Chunk`). Diffs come from SQLite when they are already stored. A commit id never changes, so a stored diff never goes stale.
 3. **The stream.** The walker publishes the diffs newest-first on a channel, the way a WebSocket would deliver real-time diffs. The replayer reads that inverted stream to its end (the turnstile), then plays it forward from an empty tree.
 4. **Applying patches.** `internal/patch` applies every patch strictly. Every resulting file must hash to the blob id GitHub reports for it at that commit, and the final tree is checked against the head tree.
-5. **Unproven files.** A file the run cannot prove is reported as unknown, with the reason, never guessed. Three causes:
-   - a binary;
-   - a patch GitHub truncated;
-   - a file older than the walked window.
-6. **Viewing.** Events go to viewers over a WebSocket. A late or reconnecting viewer replays from any index.
-7. **The code, painted.** An inverted event carries the start of one file's patch. The page shows it mirrored and red, and un-writes it: the lines the commit added erase, the lines it removed come back. A forward file event carries up to 16 lines of the rebuilt file around the change, with the lines the patch added marked. The page paints them on a sheet (context fades in, added lines type themselves out), then folds the sheet into the file's tower. A test checks that every painted line equals git's own content of that file at that commit and line number.
-8. **The city.** A tower is a file's history: one layer per change, as thick as the lines it changed, colored from red (lines removed) to blue (lines added). Its cap is the file's proof: white exact, amber unproven, magenta mismatch.
-   - The camera holds still. Right-drag turns it, and the wheel zooms.
-   - Hovering a layer names the file, its proof and size, and the commit that wrote that layer, with its lines added and removed.
-   - A click opens the file as the run rebuilt it (`GET /api/v1/reconstructions/{id}/file?path=`, served once the run is done).
-9. **Length.** A run walks to the root, up to `max_reconstruct` commits (default 1,000), paging the commit list 100 at a time. A test walks a real 230-commit history across three pages.
+5. **Changes with no patch.** GitHub sends no patch for a binary file or a very large diff. The run then fetches the blob by the id GitHub reports, proves it by its hash, and caches it in SQLite. The file's later versions build on it. Before this, one withheld patch (+2,929 −15 in tensorwire/mongoose) left every later version of that file unproven, and 10 binaries read as false mismatches. That run now proves 366 of 366 versions.
+6. **Unproven files.** A file the run cannot prove is reported as unknown, with the reason, never guessed. The reason travels to the file view. The causes left:
+   - a file older than the walked window;
+   - a blob over 20 MiB;
+   - a failed fetch.
+7. **Viewing.** Events go to viewers over a WebSocket. A late or reconnecting viewer replays from any index.
+8. **The code, painted.** An inverted event carries the start of one file's patch. The page shows it mirrored and red, and un-writes it: the lines the commit added erase, the lines it removed come back. A forward file event carries up to 16 lines of the rebuilt file around the change, with the lines the patch added marked. The page paints them on a sheet (context fades in, added lines type themselves out), then folds the sheet onto the building's roof. A test checks that every painted line equals git's own content of that file at that commit and line number.
+9. **The night city** (three.js 0.186.1 with OrbitControls and an UnrealBloom pass, simplex-noise 4.0.3; the world is seeded by the repository's name, so a repository always grows the same city).
+   - **Inverted:** the camera runs down an avenue at street level. Each commit raises a red neon arch with its headline mirrored; rain falls upward and the traffic runs backward.
+   - **Forward:** each directory is a city block on a square spiral, 25 lots a block. Each file is a skyscraper: one band of floors per change, as tall as the lines it changed, its windows lit from magenta (lines removed) to cyan (lines added). Its roof carries a beacon for the file's proof: green exact, amber unproven, red mismatch. Billboards flash commit headlines, and flying cars circle on sky lanes.
+   - **The viewer:** the camera holds still once the viewer moves it. Right-drag orbits, the wheel zooms, and middle-drag pans. Hovering a floor band names the commit that wrote it, with its lines added and removed.
+   - **Clicks:** a roof opens the current copy (`GET .../file?path=`, once the run is done). A floor band opens that change's diff (`GET .../diff?sha=&path=`, from the stored commit details, with no GitHub call).
+10. **Length.** A run walks to the root, up to `max_reconstruct` commits (default 1,000), paging the commit list 100 at a time. A test walks a real 230-commit history across three pages.
 
 ## 3. Decisions and trade-offs
 
@@ -148,12 +150,17 @@ The later work added five more mechanisms, each broken the same way:
 
 At first 4 of 5 failed as they should. The file wait survived, because no test asked for a file mid-run. A test that holds the fake GitHub mid-run now covers it; all 5 fail.
 
-**Live runs** against GitHub found four defects that no fake had shown. All are fixed, each with a regression test:
+**Live runs** against GitHub found five defects that no fake had shown. All are fixed, each with a regression test:
 
 1. **ETag 304.** GitHub's `304 Not Modified` carries no `Link` header. So a repeat reconstruction read "last page" and stopped at 70 of google/uuid's 109 commits. The client now caches `Link` with the body.
 2. **Mode-only changes.** A mode-only change arrives with no patch and `sha: null`. It was reported as 4 mismatches; it is now carried as unchanged content.
 3. **The repository regex.** The search field's `pattern` attribute was invalid under the browser's `v` regex flag, which stopped the auto-start.
 4. **The event ticker.** It overlapped its own rows once it held more than about 15.
+5. **Changes with no patch** (tensorwire/mongoose).
+   - **The defect:** one withheld patch left every later version of a file unproven, and binaries, which GitHub lists with no patch and `changes: 0`, read as false mismatches.
+   - **The fix:** the blob is fetched by id and proven by its hash.
+   - **Why no test caught it:** the fake GitHub listed binaries with `changes: 1`, unlike the real one. It now matches.
+   - **The test:** withholding one early README.md patch leaves its 12 later versions proven.
 
 The browser narrative's own live defects are listed with its measurements below.
 

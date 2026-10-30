@@ -446,8 +446,8 @@ func TestReconstructionOverWebSocket(t *testing.T) {
 		t.Fatalf("last event %+v", last)
 	}
 	s := last.Summary
-	if s.HeadExact+s.HeadUnknown != s.HeadFiles || s.HeadMissing != 0 || s.HeadUnknown != 1 {
-		t.Fatalf("summary %+v: every head file rebuilt, only the binary unproven", s)
+	if s.HeadExact != s.HeadFiles || s.HeadMissing != 0 || s.Fetched < 1 {
+		t.Fatalf("summary %+v: every head file proven, the binary by its fetched blob", s)
 	}
 	var st reconstruct.Status
 	e.get(start["status"], &st)
@@ -474,15 +474,43 @@ func TestReconstructionOverWebSocket(t *testing.T) {
 	if r := e.get(file+"README.md", &f); r.StatusCode != 200 || !f.Known || f.Content != e.repo.Git("show", "main:README.md") {
 		t.Fatalf("README.md: %d known=%v, %d bytes against git's %d", r.StatusCode, f.Known, len(f.Content), len(e.repo.Git("show", "main:README.md")))
 	}
-	f = struct {
-		Known   bool   `json:"known"`
-		Content string `json:"content"`
-	}{}
-	if r := e.get(file+"logo.bin", &f); r.StatusCode != 200 || f.Known || f.Content != "" {
-		t.Fatalf("logo.bin: %d %+v", r.StatusCode, f)
+	// The binary is proven (its blob fetched by id), and served as binary.
+	var bin struct {
+		Known  bool `json:"known"`
+		Binary bool `json:"binary"`
+		Bytes  int  `json:"bytes"`
+	}
+	if r := e.get(file+"logo.bin", &bin); r.StatusCode != 200 || !bin.Known || !bin.Binary || bin.Bytes != len(e.repo.Git("show", "main:logo.bin")) {
+		t.Fatalf("logo.bin: %d %+v", r.StatusCode, bin)
 	}
 	if r := e.get(file+"nope.go", nil); r.StatusCode != 404 {
 		t.Fatalf("unknown path: %d", r.StatusCode)
+	}
+	// A layer's diff: the file's change in one commit, equal to git's own patch.
+	var commit reconstruct.Event
+	for _, ev := range events {
+		if ev.T == "commit" {
+			commit = ev
+		}
+		if ev.T == "file" && ev.Path == "README.md" && ev.Op == "modified" && commit.SHA != "" {
+			break
+		}
+	}
+	diff := strings.TrimSuffix(start["events"], "/events") + "/diff?sha=" + commit.SHA + "&path=README.md"
+	var d struct {
+		Patch     string `json:"patch"`
+		Additions int    `json:"additions"`
+		Status    string `json:"status"`
+	}
+	want := e.repo.Git("diff", "--no-color", commit.SHA+"^", commit.SHA, "--", "README.md")
+	if r := e.get(diff, &d); r.StatusCode != 200 || d.Status != "modified" || d.Patch == "" || !strings.Contains(want, d.Patch) {
+		t.Fatalf("diff: %d %+v\ngit:\n%s", r.StatusCode, d, want)
+	}
+	if r := e.get(strings.Replace(diff, "README.md", "nope.go", 1), nil); r.StatusCode != 404 {
+		t.Fatalf("diff of a file the commit does not touch: %d", r.StatusCode)
+	}
+	if r := e.get(strings.Replace(diff, commit.SHA, "zz", 1), nil); r.StatusCode != 400 {
+		t.Fatalf("bad commit id: %d", r.StatusCode)
 	}
 }
 

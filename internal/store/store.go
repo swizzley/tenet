@@ -6,8 +6,9 @@
 //   - coverage: the periods already fetched. A period that ended at least an hour
 //     before its fetch is history and is served from disk for good; a period that
 //     reaches into the last hour is served from disk only within the cache TTL.
-//   - commit_details: a commit's files and patches, immutable by sha, for the
-//     reconstruction.
+//   - commit_details: for the reconstruction, a commit's files and patches by
+//     commit id, and the blobs fetched when GitHub sent no patch (key
+//     "blob:<id>"). Both are immutable by id.
 package store
 
 import (
