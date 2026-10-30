@@ -1,13 +1,14 @@
 // Tenet: reconstruct a repository from its diffs, as a temporal pincer.
 // Phase 1 (red, inverted): the server walks back through history; each commit
-// arrives as a ring receding down a tunnel, its headline mirrored, while particles
-// fall inward (entropy running backward). The turnstile flips time. Phase 2 (blue,
-// forward): each diff replays; every file's shards un-shatter into its slab in a
-// city of directories, colored by proof: exact (blue), unproven (amber), mismatch (red).
+// arrives as a ring receding down a tunnel, its headline mirrored, its diff
+// un-writing itself, while particles fall inward (entropy running backward). The
+// turnstile flips time. Phase 2 (blue, forward): each diff replays; each rebuilt
+// file paints itself, then folds into its tower in a city of directories, a tower
+// built of one layer per change. The viewer turns, zooms, hovers and opens files.
 // All server text is untrusted: it is drawn on canvases or set with textContent.
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
 
-const RED = new THREE.Color(0xff3b3b), BLUE = new THREE.Color(0x3d8bff), AMBER = new THREE.Color(0xffb547);
+const RED = new THREE.Color(0xff3b3b), BLUE = new THREE.Color(0x3d8bff);
 const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const $ = (id) => document.getElementById(id);
 
@@ -106,10 +107,17 @@ scene.add(city);
 const box = new THREE.BoxGeometry(1, 1, 1);
 const shardGeo = new THREE.TetrahedronGeometry(0.16);
 // The city: each directory is a district on a golden-angle spiral; each file is a
-// tower in its district (a smaller spiral), standing on the ground, its height
-// growing with its line count.
-const dirs = new Map();   // dir -> {x, z, next, files: Map(path -> mesh)}
+// tower in its district (a smaller spiral). A tower is its history: one layer per
+// change, as thick as the lines it changed, colored from red (lines removed) to
+// blue (lines added). Its cap shows the file's proof: white exact, amber
+// unproven, magenta mismatch.
+const dirs = new Map();   // dir -> {x, z, next, files: Map(path -> tower)}
 const shards = [];
+const pickables = [];     // the layers and caps a pointer can hover or click
+const ADDED = new THREE.Color(0x3d8bff), REMOVED = new THREE.Color(0xff3b3b);
+const CAP = { exact: 0xeef4ff, unknown: 0xffb547, mismatch: 0xff2bd6 };
+const MAX_LAYERS = 120;   // a tower keeps its newest changes; older ones count in tw.dropped
+let commitNow = null;     // the commit being replayed, for its layers
 let extent = 6;           // how far the city reaches, for the camera
 function dirOf(path) { const i = path.lastIndexOf('/'); return i < 0 ? '/' : path.slice(0, i); }
 function dirSlot(d) {
@@ -130,59 +138,216 @@ function lot(slot) { // the next free tower position in a district
   extent = Math.max(extent, Math.hypot(p.x, p.z) + 4);
   return p;
 }
-const statusColor = (s) => (s === 'exact' ? BLUE : s === 'mismatch' ? RED : AMBER);
+function newTower(slot, path) {
+  const p = lot(slot);
+  const group = new THREE.Group();
+  group.position.set(p.x, 0, p.z);
+  city.add(group);
+  const cap = new THREE.Mesh(box, new THREE.MeshStandardMaterial({ emissiveIntensity: 0.9, roughness: 0.3 }));
+  cap.scale.set(1.42, 0.09, 1.42);
+  group.add(cap);
+  const tw = { path, group, cap, layers: [], top: 0, versions: 0, dropped: 0, status: '', lines: 0 };
+  cap.userData.tower = tw;
+  pickables.push(cap);
+  slot.files.set(path, tw);
+  return tw;
+}
 function forwardFile(e) {
   if (e.op === 'renamed' && e.from) removeFile(e.from, false);
   if (e.status === 'deleted') { removeFile(e.path, true); return; }
   const slot = dirSlot(dirOf(e.path));
-  let m = slot.files.get(e.path);
-  const h = Math.min(9, 0.2 + Math.log2((e.lines || e.adds || 1) + 1) * 0.6);
-  const col = statusColor(e.status);
-  if (!m) {
-    const p = lot(slot);
-    m = new THREE.Mesh(box, new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: 0.55, roughness: 0.35, metalness: 0.2, transparent: true, opacity: 0.92 }));
-    m.scale.set(1.3, 0.001, 1.3);
-    m.position.set(p.x, 0, p.z);
-    city.add(m);
-    slot.files.set(e.path, m);
-  } else {
-    m.material.color.copy(col);
-    m.material.emissive.copy(col);
+  const tw = slot.files.get(e.path) || newTower(slot, e.path);
+  const adds = e.adds || 0, dels = e.dels || 0;
+  const col = REMOVED.clone().lerp(ADDED, adds + dels ? adds / (adds + dels) : 0.5);
+  const th = Math.min(1.4, 0.1 + Math.log2(1 + adds + dels) * 0.1);
+  const m = new THREE.Mesh(box, new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: 0.45, roughness: 0.4, metalness: 0.15 }));
+  m.scale.set(1.3, 0.001, 1.3);
+  m.position.y = tw.top;
+  m.userData = { tower: tw, th, y: tw.top + th / 2, flash: 1, adds, dels, commit: commitNow };
+  tw.group.add(m);
+  tw.layers.push(m);
+  pickables.push(m);
+  tw.top += th;
+  if (tw.layers.length > MAX_LAYERS) { // drop the oldest layer; the rest settle down
+    const old = tw.layers.shift();
+    pickables.splice(pickables.indexOf(old), 1);
+    dispose(old, tw.group);
+    tw.dropped++;
+    tw.top -= old.userData.th;
+    for (const l of tw.layers) l.userData.y -= old.userData.th;
   }
-  m.userData.h = h;
-  m.userData.ty = h / 2;
-  m.userData.flash = 1;
-  // un-shatter: shards start scattered and converge on the slab
-  const n = reduced ? 2 : Math.min(14, 3 + (e.adds || 0) / 6);
+  tw.versions++;
+  tw.status = e.status;
+  tw.lines = e.lines || 0;
+  tw.cap.material.color.setHex(CAP[e.status] ?? CAP.unknown);
+  tw.cap.material.emissive.setHex(CAP[e.status] ?? CAP.unknown);
+  // un-shatter: shards start scattered and converge on the new layer
+  const to = new THREE.Vector3(tw.group.position.x, tw.top, tw.group.position.z);
+  const n = reduced ? 2 : Math.min(14, 3 + adds / 6);
   for (let k = 0; k < n && shards.length < 700; k++) {
     const s = new THREE.Mesh(shardGeo, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.95 }));
     const a = Math.random() * Math.PI * 2, r = 8 + Math.random() * 14;
-    s.position.set(slot.x + Math.cos(a) * r, m.userData.ty + (Math.random() - 0.2) * 12, slot.z + Math.sin(a) * r);
-    s.userData = { from: s.position.clone(), to: m, t: 0, dur: 0.6 + Math.random() * 0.5, inward: true };
+    s.position.set(slot.x + Math.cos(a) * r, to.y + (Math.random() - 0.2) * 12, slot.z + Math.sin(a) * r);
+    s.userData = { from: s.position.clone(), dest: to, t: 0, dur: 0.6 + Math.random() * 0.5, inward: true };
     city.add(s);
     shards.push(s);
   }
 }
 function removeFile(path, burst) {
   const slot = dirs.get(dirOf(path));
-  const m = slot && slot.files.get(path);
-  if (!m) return;
+  const tw = slot && slot.files.get(path);
+  if (!tw) return;
   slot.files.delete(path);
-  if (burst) { // deletion runs forward: the slab shatters outward
+  if (burst) { // deletion runs forward: the tower shatters outward
+    const at = tw.group.position.clone().setY(tw.top / 2);
     for (let k = 0; k < 8 && shards.length < 700; k++) {
       const s = new THREE.Mesh(shardGeo, new THREE.MeshBasicMaterial({ color: 0x8a96b0, transparent: true, opacity: 0.9 }));
-      s.position.copy(m.position);
+      s.position.copy(at);
       const a = Math.random() * Math.PI * 2;
-      s.userData = { from: m.position.clone(), dest: m.position.clone().add(new THREE.Vector3(Math.cos(a) * 9, Math.random() * 6, Math.sin(a) * 9)), t: 0, dur: 0.9, inward: false };
+      s.userData = { from: at.clone(), dest: at.clone().add(new THREE.Vector3(Math.cos(a) * 9, Math.random() * 6, Math.sin(a) * 9)), t: 0, dur: 0.9, inward: false };
       city.add(s);
       shards.push(s);
     }
   }
-  dispose(m, city);
+  for (const m of [...tw.layers, tw.cap]) pickables.splice(pickables.indexOf(m), 1);
+  dispose(tw.group, city);
 }
 function dispose(o, parent) {
   parent.remove(o);
-  if (o.material) { if (o.material.map) o.material.map.dispose(); o.material.dispose(); }
+  o.traverse((x) => { if (x.material) { if (x.material.map) x.material.map.dispose(); x.material.dispose(); } });
+}
+
+// ---------- code sheets: the code itself, painted ----------
+// Inverted, a commit's diff is shown mirrored and un-writes itself (its added
+// lines erase, its removed lines come back), then recedes down the tunnel to its
+// ring. Forward, each rebuilt file is painted (context fades in, the lines the
+// patch added type themselves out), then the sheet folds into its tower: the code
+// layered into the city. Under a backlog only a sample is painted. The text is
+// the repository's, so it only ever reaches a canvas.
+const SW = 1024, SH = 560, LH = 30;
+const sheetGeo = new THREE.PlaneGeometry(7.2, 7.2 * SH / SW);
+const sheets = [];
+function makeSheet(kind, e, dur) {
+  const c = document.createElement('canvas');
+  c.width = SW; c.height = SH;
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const m = new THREE.Mesh(sheetGeo, new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide }));
+  m.userData = { kind, e, g: c.getContext('2d'), tex, t: 0, dur, state: 'paint', order: [...(e.added || [])].sort((a, b) => a - b) };
+  return m;
+}
+const clamp01 = (x) => Math.max(0, Math.min(1, x));
+function paintSheet(u, p) {
+  const g = u.g, e = u.e, inv = u.kind === 'inv';
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.clearRect(0, 0, SW, SH);
+  if (inv) { g.translate(SW, 0); g.scale(-1, 1); } // read from the other side of the turnstile
+  g.fillStyle = inv ? 'rgba(28, 6, 8, 0.86)' : 'rgba(6, 10, 22, 0.86)';
+  g.fillRect(0, 0, SW, SH);
+  g.strokeStyle = inv ? 'rgba(255, 59, 59, 0.7)' : e.status === 'exact' ? 'rgba(61, 139, 255, 0.8)' : 'rgba(255, 181, 71, 0.8)';
+  g.lineWidth = 3;
+  g.strokeRect(1.5, 1.5, SW - 3, SH - 3);
+  g.font = '20px ui-monospace, Menlo, monospace';
+  g.textBaseline = 'middle';
+  g.fillStyle = inv ? '#ff8a8a' : '#9cc3ff';
+  g.fillText(`${inv ? '◂ ' + (e.sha || '').slice(0, 8) : '▸ ' + e.status}  ${e.path || ''}`.slice(0, 84), 18, 26);
+  g.font = '22px ui-monospace, Menlo, monospace';
+  const lines = inv ? e.diff : e.code;
+  for (let i = 0; i < lines.length; i++) {
+    const y = 66 + i * LH;
+    if (inv) {
+      const mark = lines[i][0], text = lines[i].slice(1);
+      // running backward: what the commit added is erased, what it removed returns
+      const f = mark === '+' ? 1 - p : mark === '-' ? p : 1;
+      const shown = text.slice(0, Math.round(text.length * f));
+      g.fillStyle = mark === '+' ? '#ff6b6b' : mark === '-' ? '#ffd6d6' : 'rgba(255, 160, 160, 0.45)';
+      g.fillText(`${mark} ${shown}`, 18, y);
+      if (mark !== ' ' && f > 0 && f < 1) g.fillRect(18 + g.measureText(`${mark} ${shown}`).width + 2, y - 11, 12, 22);
+      continue;
+    }
+    g.fillStyle = 'rgba(124, 133, 151, 0.8)';
+    g.fillText(String(e.at + i).padStart(4), 12, y);
+    const k = u.order.indexOf(i);
+    if (k < 0) { // context: fades in
+      g.fillStyle = `rgba(150, 165, 190, ${0.75 * clamp01(p * 4)})`;
+      g.fillText(lines[i], 84, y);
+      continue;
+    }
+    // an added line types itself out, in order
+    const n = u.order.length, start = 0.12 + (0.72 * k) / n;
+    const f = clamp01((p - start) / (0.72 / n + 0.06));
+    if (f <= 0) continue;
+    const shown = lines[i].slice(0, Math.round(lines[i].length * f));
+    g.fillStyle = 'rgba(61, 139, 255, 0.16)';
+    g.fillRect(78, y - 14, Math.max(8, g.measureText(shown).width + 12), 28);
+    g.fillStyle = '#e3eeff';
+    g.fillText(shown, 84, y);
+    if (f < 1) { g.fillStyle = '#3d8bff'; g.fillRect(84 + g.measureText(shown).width + 2, y - 11, 12, 22); }
+  }
+  u.tex.needsUpdate = true;
+}
+// Both kinds are painted large before the camera. (Hung in the tunnel instead,
+// the inverted sheets sat far ahead of a camera that trails a backlog, too small
+// to read: seen live, google/uuid.)
+function newSheet(kind, e, dur) {
+  const busy = sheets.find((s) => s.userData.kind === kind && s.userData.state === 'paint');
+  if (busy && busy.userData.t < 0.45) return null; // under a backlog, paint a sample, not every change
+  if (busy) fold(busy);
+  if (sheets.filter((s) => s.userData.kind === kind).length >= 8) retire(sheets.find((s) => s.userData.kind === kind));
+  const s = makeSheet(kind, e, dur);
+  scene.add(s);
+  sheets.push(s);
+  placeBeforeCamera(s);
+  return s;
+}
+function invSheet(e) {
+  const s = newSheet('inv', e, Math.max(0.4, Math.min(1.5, 1.5 - queue.length / 150)));
+  if (s) s.userData.to = new THREE.Vector3((e.i % 2 ? -1 : 1) * 2.5, (e.i % 3 - 1) * 1.2, -depth);
+}
+function fwdSheet(e) {
+  const s = newSheet('fwd', e, Math.max(0.4, Math.min(1.8, 1.8 - queue.length / 120)));
+  const slot = dirs.get(dirOf(e.path));
+  if (s) s.userData.tower = slot && slot.files.get(e.path);
+}
+const _v = new THREE.Vector3(), _r = new THREE.Vector3();
+function placeBeforeCamera(s) { // forward sheets to the left, inverted to the right
+  camera.getWorldDirection(_v);
+  _r.crossVectors(_v, camera.up).normalize();
+  const side = s.userData.kind === 'inv' ? 2.6 : -2.6;
+  s.position.copy(camera.position).addScaledVector(_v, 9).addScaledVector(_r, side).addScaledVector(camera.up, s.userData.kind === 'inv' ? -0.6 : 1.1);
+  s.quaternion.copy(camera.quaternion);
+}
+function fold(s) { // paint it whole, then send it into its tower, or down the tunnel
+  const u = s.userData;
+  paintSheet(u, 1);
+  u.state = 'fold';
+  u.t = 0;
+  u.from = s.position.clone();
+}
+function retire(s) {
+  if (!s) return;
+  sheets.splice(sheets.indexOf(s), 1);
+  dispose(s, s.parent || scene);
+}
+function stepSheets(dt) {
+  for (const s of [...sheets]) {
+    const u = s.userData;
+    if (u.state === 'paint') {
+      u.t = Math.min(1, u.t + dt / u.dur);
+      s.material.opacity = Math.min(0.96, s.material.opacity + dt * 4);
+      paintSheet(u, ease(u.t));
+      placeBeforeCamera(s);
+      if (u.t >= 1) fold(s);
+    } else if (u.state === 'fold') {
+      u.t = Math.min(1, u.t + dt / (u.kind === 'inv' ? 1.1 : 0.8));
+      const tw = u.tower && u.tower.group.parent ? u.tower : null;
+      const to = u.kind === 'inv' ? u.to : tw ? _v.copy(tw.group.position).setY(tw.top + 0.3) : u.from;
+      s.position.lerpVectors(u.from, to, ease(u.t));
+      s.scale.setScalar(1 - 0.94 * ease(u.t));
+      s.material.opacity = 0.96 * (1 - u.t * u.t);
+      if (u.t >= 1) { if (tw && tw.layers.length) tw.layers.at(-1).userData.flash = 1; retire(s); }
+    }
+  }
 }
 
 // ---------- HUD ----------
@@ -215,6 +380,7 @@ function handle(e) {
     case 'invert':
       stats.commits = e.i; clock = -e.i;
       invertCommit(e);
+      if (e.diff && !reduced) invSheet(e);
       tick(`◂ ${e.sha.slice(0, 8)} ${e.headline || ''}`, 'inv');
       break;
     case 'turnstile':
@@ -233,6 +399,7 @@ function handle(e) {
         scene.fog.density = 0.008;
       }
       clock = e.i;
+      commitNow = { sha: e.sha, headline: e.headline || '', author: e.author || '', date: (e.date || '').slice(0, 10) };
       tick(`▸ ${e.sha.slice(0, 8)} ${e.headline || ''}`, 'fwd');
       break;
     case 'file':
@@ -241,9 +408,11 @@ function handle(e) {
         stats[e.status] = (stats[e.status] || 0) + 1;
       }
       forwardFile(e);
+      if (e.code && !reduced) fwdSheet(e);
       tick(`${e.status.padEnd(8)} ${e.path}${e.why ? ' · ' + e.why : ''}`, e.status);
       break;
     case 'done':
+      runDone = true;
       showSummary(e.summary);
       break;
     case 'error':
@@ -273,6 +442,7 @@ function showSummary(s) {
   }
   $('sum-fine').textContent = 'Each file version is checked against the blob id GitHub reports for it; the final tree against the head commit. Unproven means the content was never streamed (a binary, a truncated patch, or a file older than the window), never guessed.';
   $('summary').hidden = false;
+  $('summary').onclick = () => { $('summary').hidden = true; }; // out of the way of the city
   $('go').disabled = false;
   say('done · enter another repository to run again');
 }
@@ -290,7 +460,10 @@ function connect() {
 
 function reset() {
   for (const g of [tunnel, city]) while (g.children.length) dispose(g.children[0], g);
-  dirs.clear(); shards.length = 0; queue = []; received = 0; depth = 0; clock = 0; extent = 6;
+  for (const s of [...sheets]) retire(s);
+  dirs.clear(); shards.length = 0; pickables.length = 0; queue = []; received = 0; depth = 0; clock = 0; extent = 6;
+  commitNow = null; runDone = false; hover = null; tip.hidden = true; closeFile();
+  Object.assign(view, { theta: 0.8, phi: 1.0, zoomed: false });
   Object.keys(stats).forEach((k) => (stats[k] = 0));
   phase = 'inv'; entropy = -1; turnstile.visible = false; flyThrough = null;
   pMat.color.copy(RED); scene.fog.density = 0.012;
@@ -321,6 +494,87 @@ $('query').addEventListener('submit', async (ev) => {
     $('go').disabled = false;
   }
 });
+
+// ---------- the viewer's hands: turn, zoom, hover, open ----------
+const view = { theta: 0.8, phi: 1.0, r: 30, zoomed: false, target: new THREE.Vector3(0, 1.5, 0) };
+let hover = null, runDone = false, drag = null;
+const canvas = $('scene'), tip = $('tip');
+const raycaster = new THREE.Raycaster(), ndc = new THREE.Vector2();
+canvas.addEventListener('contextmenu', (ev) => ev.preventDefault()); // right button turns the camera
+canvas.addEventListener('pointerdown', (ev) => {
+  drag = { x: ev.clientX, y: ev.clientY, button: ev.button, moved: 0 };
+  canvas.setPointerCapture(ev.pointerId);
+});
+canvas.addEventListener('pointermove', (ev) => {
+  if (drag) {
+    const dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
+    drag.moved += Math.abs(dx) + Math.abs(dy);
+    drag.x = ev.clientX; drag.y = ev.clientY;
+    if (drag.button === 2 && phase === 'fwd') {
+      view.theta -= dx * 0.006;
+      view.phi = Math.min(1.45, Math.max(0.15, view.phi - dy * 0.006));
+    }
+  }
+  pick(ev.clientX, ev.clientY);
+});
+canvas.addEventListener('pointerup', (ev) => {
+  if (drag && drag.button === 0 && drag.moved < 5 && hover) openFile(hover.tower);
+  drag = null;
+});
+canvas.addEventListener('pointerleave', () => { hover = null; tip.hidden = true; });
+canvas.addEventListener('wheel', (ev) => {
+  if (phase !== 'fwd') return;
+  ev.preventDefault();
+  view.r = Math.min(400, Math.max(4, view.r * Math.exp(ev.deltaY * 0.001)));
+  view.zoomed = true;
+}, { passive: false });
+
+// pick finds the layer or cap under the pointer and fills the tooltip.
+function pick(x, y) {
+  if (phase !== 'fwd' || (drag && drag.button === 2)) { hover = null; tip.hidden = true; return; }
+  ndc.set((x / innerWidth) * 2 - 1, -(y / innerHeight) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+  const hit = raycaster.intersectObjects(pickables, false)[0];
+  if (!hit) { hover = null; tip.hidden = true; canvas.style.cursor = ''; return; }
+  const u = hit.object.userData, tw = u.tower;
+  hover = { tower: tw, layer: u.commit !== undefined ? hit.object : null };
+  const status = { exact: 'proven exact', unknown: 'unproven', mismatch: 'mismatch' }[tw.status] || tw.status;
+  const rows = [tw.path, `${status} · ${tw.lines} lines · ${tw.versions} versions${tw.dropped ? ` (${tw.dropped} oldest not drawn)` : ''}`];
+  if (hover.layer && u.commit) rows.push(`${u.commit.sha.slice(0, 8)} ${u.commit.date} ${u.commit.author}`, u.commit.headline, `+${u.adds} −${u.dels} lines`);
+  rows.push('click to open the file');
+  tip.replaceChildren(...rows.map((r, i) => { const d = document.createElement('div'); d.textContent = r; if (i === 0) d.className = 'path'; return d; }));
+  tip.style.left = `${Math.min(x + 16, innerWidth - 340)}px`;
+  tip.style.top = `${Math.min(y + 16, innerHeight - 140)}px`;
+  tip.hidden = false;
+  canvas.style.cursor = 'pointer';
+}
+
+// openFile shows a rebuilt file, from the session, once the run is done.
+async function openFile(tw) {
+  const panel = $('file');
+  $('f-path').textContent = tw.path;
+  $('f-code').textContent = '';
+  panel.hidden = false;
+  document.body.classList.add('filing');
+  if (!runDone) { $('f-meta').textContent = 'the files open when the reconstruction is done'; return; }
+  $('f-meta').textContent = 'opening…';
+  try {
+    const r = await fetch(`/api/v1/reconstructions/${sessionId}/file?path=${encodeURIComponent(tw.path)}`);
+    const f = await r.json();
+    if (!r.ok) throw new Error(f.error ? f.error.message : r.statusText);
+    if (!f.known) { $('f-meta').textContent = `unproven: the rebuilt history never held this file's content (${tw.status})`; return; }
+    if (f.binary) { $('f-meta').textContent = `${f.bytes} bytes, binary`; return; }
+    const lines = f.content.replace(/\n$/, '').split('\n');
+    const w = String(lines.length).length;
+    $('f-meta').textContent = `rebuilt from diffs alone and proven against GitHub's blob id · ${lines.length} lines · ${tw.versions} versions${f.truncated ? ' · first 1 MB shown' : ''}`;
+    $('f-code').textContent = lines.map((l, i) => `${String(i + 1).padStart(w)}  ${l}`).join('\n');
+  } catch (err) {
+    $('f-meta').textContent = err.message;
+  }
+}
+function closeFile() { $('file').hidden = true; document.body.classList.remove('filing'); }
+$('f-close').addEventListener('click', closeFile);
+addEventListener('keydown', (ev) => { if (ev.key === 'Escape') closeFile(); });
 
 // ---------- the loop ----------
 let flyThrough = null, last = performance.now(), tokens = 0;
@@ -355,13 +609,18 @@ function frame(now) {
       requestAnimationFrame(() => requestAnimationFrame(() => f.classList.remove('on')));
       tunnel.visible = false; turnstile.visible = false;
     }
-    if (t >= 1) { flyThrough = null; tunnel.visible = true; while (tunnel.children.length) dispose(tunnel.children[0], tunnel); }
+    if (t >= 1) {
+      flyThrough = null; tunnel.visible = true;
+      while (tunnel.children.length) dispose(tunnel.children[0], tunnel);
+      for (const s of sheets.filter((x) => x.userData.kind === 'inv')) retire(s);
+    }
   } else if (phase === 'fwd') {
-    // orbit the whole city, low enough to read a skyline, far enough to hold it all
-    const r = 10 + extent * 1.35;
-    const a = now / 9000;
-    camera.position.lerp(new THREE.Vector3(Math.cos(a) * r, 4 + r * 0.42, Math.sin(a) * r), Math.min(1, dt * 1.5));
-    camera.lookAt(0, 1.5, 0);
+    // The camera holds still: right-drag turns it, the wheel zooms. Until the
+    // viewer zooms, its distance follows the city so all of it stays in view.
+    if (!view.zoomed) view.r = 10 + extent * 1.35;
+    const want = new THREE.Vector3().setFromSphericalCoords(view.r, view.phi, view.theta).add(view.target);
+    camera.position.lerp(want, Math.min(1, dt * 4));
+    camera.lookAt(view.target);
   }
 
   // tunnel rings spin; the newest glow
@@ -384,29 +643,35 @@ function frame(now) {
   }
   pGeo.attributes.position.needsUpdate = true;
 
-  // slabs grow to their height and settle; a fresh change flashes
+  // layers grow to their thickness and settle; a fresh one flashes; the hovered
+  // tower glows
+  const k6 = Math.min(1, dt * 6);
   for (const slot of dirs.values()) {
-    for (const m of slot.files.values()) {
-      m.scale.y += (m.userData.h - m.scale.y) * Math.min(1, dt * 6);
-      m.position.y += (m.userData.ty - m.position.y) * Math.min(1, dt * 6);
-      if (m.userData.flash > 0) {
-        m.userData.flash = Math.max(0, m.userData.flash - dt * 1.5);
-        m.material.emissiveIntensity = 0.55 + m.userData.flash * 1.8;
+    for (const tw of slot.files.values()) {
+      const lit = hover && hover.tower === tw ? 0.5 : 0;
+      for (const m of tw.layers) {
+        const u = m.userData;
+        m.scale.y += (u.th - m.scale.y) * k6;
+        m.position.y += (u.y - m.position.y) * k6;
+        u.flash = Math.max(0, u.flash - dt * 1.5);
+        m.material.emissiveIntensity = 0.45 + lit + u.flash * 1.8 + (hover && hover.layer === m ? 0.8 : 0);
       }
+      tw.cap.position.y += (tw.top + 0.045 - tw.cap.position.y) * k6;
     }
   }
 
-  // shards: inward ones converge on their slab (un-shattering), outward ones fly off
+  // shards: inward ones converge on their layer (un-shattering), outward ones fly off
   for (let k = shards.length - 1; k >= 0; k--) {
     const s = shards[k], u = s.userData;
     u.t += dt / u.dur;
     const t = Math.min(1, u.t);
-    const dest = u.inward ? u.to.position : u.dest;
-    s.position.lerpVectors(u.from, dest, u.inward ? ease(t) : t);
+    s.position.lerpVectors(u.from, u.dest, u.inward ? ease(t) : t);
     s.rotation.x += dt * 6; s.rotation.y += dt * 4;
     s.material.opacity = u.inward ? 0.95 : 0.9 * (1 - t);
     if (t >= 1) { dispose(s, city); shards.splice(k, 1); }
   }
+
+  stepSheets(dt);
 
   // the clock counts down while inverted, up once forward
   const c = Math.abs(clock);

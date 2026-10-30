@@ -18,6 +18,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,28 +38,33 @@ import (
 //	done      the summary
 //	error     the run failed
 type Event struct {
-	T        string   `json:"t"`
-	I        int      `json:"i,omitempty"`
-	Repo     string   `json:"repo,omitempty"`
-	Branch   string   `json:"branch,omitempty"`
-	SHA      string   `json:"sha,omitempty"`
-	Author   string   `json:"author,omitempty"`
-	Date     string   `json:"date,omitempty"`
-	Headline string   `json:"headline,omitempty"`
-	Files    int      `json:"files,omitempty"`
-	Path     string   `json:"path,omitempty"`
-	From     string   `json:"from,omitempty"`
-	Op       string   `json:"op,omitempty"`
-	Status   string   `json:"status,omitempty"` // exact | unknown | mismatch | deleted
-	Why      string   `json:"why,omitempty"`
-	Lines    int      `json:"lines,omitempty"`
-	Adds     int      `json:"adds,omitempty"`
-	Dels     int      `json:"dels,omitempty"`
-	Snippet  []string `json:"snippet,omitempty"`
-	Commits  int      `json:"commits,omitempty"`
-	Root     bool     `json:"root,omitempty"`
-	Summary  *Summary `json:"summary,omitempty"`
-	Msg      string   `json:"msg,omitempty"`
+	T        string `json:"t"`
+	I        int    `json:"i,omitempty"`
+	Repo     string `json:"repo,omitempty"`
+	Branch   string `json:"branch,omitempty"`
+	SHA      string `json:"sha,omitempty"`
+	Author   string `json:"author,omitempty"`
+	Date     string `json:"date,omitempty"`
+	Headline string `json:"headline,omitempty"`
+	Files    int    `json:"files,omitempty"`
+	Path     string `json:"path,omitempty"`
+	From     string `json:"from,omitempty"`
+	Op       string `json:"op,omitempty"`
+	Status   string `json:"status,omitempty"` // exact | unknown | mismatch | deleted
+	Why      string `json:"why,omitempty"`
+	Lines    int    `json:"lines,omitempty"`
+	Adds     int    `json:"adds,omitempty"`
+	Dels     int    `json:"dels,omitempty"`
+	// For the page to paint the code. All of it is untrusted text from the
+	// repository; the page draws it on canvases, never as HTML.
+	Diff    []string `json:"diff,omitempty"`  // invert: the start of one file's patch, "+"/"-"/" " lines
+	Code    []string `json:"code,omitempty"`  // file: up to 16 lines of the rebuilt file, around the change
+	At      int      `json:"at,omitempty"`    // file: the line number of Code[0]
+	Added   []int    `json:"added,omitempty"` // file: indices into Code of the lines this patch added
+	Commits int      `json:"commits,omitempty"`
+	Root    bool     `json:"root,omitempty"`
+	Summary *Summary `json:"summary,omitempty"`
+	Msg     string   `json:"msg,omitempty"`
 }
 
 // Summary is the proof at the end of a run.
@@ -105,6 +112,19 @@ type Runner struct {
 
 // Run reconstructs owner/name, walking at most max commits, and emits events.
 func (r *Runner) Run(ctx context.Context, owner, name string, max int, emit func(Event)) (*Summary, error) {
+	sum, _, err := r.RunFiles(ctx, owner, name, max, emit)
+	return sum, err
+}
+
+// File is one rebuilt file at the end of a run: its content when proven, or
+// unknown (Known false, no content).
+type File struct {
+	Content []byte
+	Known   bool
+}
+
+// RunFiles is Run, and also returns the rebuilt files, so a viewer can open one.
+func (r *Runner) RunFiles(ctx context.Context, owner, name string, max int, emit func(Event)) (*Summary, map[string]File, error) {
 	start := time.Now()
 	stream := make(chan github.Commit, 64)
 	sum := &Summary{}
@@ -120,17 +140,21 @@ func (r *Runner) Run(ctx context.Context, owner, name string, max int, emit func
 	files, err := r.replay(ctx, stream, sum, emit)
 	wg.Wait()
 	if walkErr != nil {
-		return nil, walkErr
+		return nil, nil, walkErr
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := r.checkTree(ctx, owner, name, head, files, sum); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	sum.Millis = time.Since(start).Milliseconds()
+	out := make(map[string]File, len(files))
+	for p, f := range files {
+		out[p] = File{Content: f.content, Known: f.known}
+	}
 	emit(Event{T: "done", Summary: sum})
-	return sum, nil
+	return sum, out, nil
 }
 
 // walk finds the first-parent chain from the head, fetches the commits' diffs in
@@ -243,8 +267,15 @@ func (r *Runner) replay(ctx context.Context, stream <-chan github.Commit, sum *S
 	var inverted []github.Commit
 	for c := range stream {
 		inverted = append(inverted, c)
-		emit(Event{T: "invert", I: len(inverted), SHA: c.SHA, Author: author(c), Date: c.Commit.Author.Date.UTC().Format(time.RFC3339),
-			Headline: headline(c.Commit.Message), Files: len(c.Files)})
+		ev := Event{T: "invert", I: len(inverted), SHA: c.SHA, Author: author(c), Date: c.Commit.Author.Date.UTC().Format(time.RFC3339),
+			Headline: headline(c.Commit.Message), Files: len(c.Files)}
+		for _, f := range c.Files {
+			if d := diffHead(f.Patch, 10); len(d) > 0 {
+				ev.Path, ev.Diff = f.Filename, d
+				break
+			}
+		}
+		emit(ev)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -291,7 +322,7 @@ func (r *Runner) replay(ctx context.Context, stream <-chan github.Commit, sum *S
 // apply plays one file change and proves the result. It returns the event and the
 // change in rebuilt bytes.
 func apply(files map[string]*file, f github.File, fromRoot bool) (Event, int) {
-	ev := Event{T: "file", Path: f.Filename, Op: f.Status, Adds: f.Additions, Dels: f.Deletions, Snippet: snippet(f.Patch)}
+	ev := Event{T: "file", Path: f.Filename, Op: f.Status, Adds: f.Additions, Dels: f.Deletions}
 	before := 0
 	if old := files[f.Filename]; old != nil {
 		before = len(old.content)
@@ -351,6 +382,7 @@ func apply(files map[string]*file, f github.File, fromRoot bool) (Event, int) {
 		out = &file{content: content, known: true}
 		ev.Status = "exact"
 		ev.Lines = strings.Count(string(content), "\n")
+		ev.Code, ev.At, ev.Added = excerpt(content, f.Patch)
 	}
 	files[f.Filename] = out
 	return ev, len(out.content) - before
@@ -396,19 +428,86 @@ func headline(msg string) string {
 	return clip(h, 120)
 }
 
-// snippet is up to 4 added lines, for the animation. It is untrusted text; the
-// page draws it on a canvas, never as HTML.
-func snippet(p string) []string {
-	var out []string
+// codeLines is how much of a file the page paints at once.
+const codeLines = 16
+
+// codeLine readies one line of code for the page: tabs as two spaces, cut to 96
+// characters, control characters dropped (clip).
+func codeLine(s string) string {
+	return clip(strings.ReplaceAll(strings.TrimRight(s, "\r"), "\t", "  "), 96)
+}
+
+// diffHead is the part of a patch the inverted phase shows: up to n of its
+// "+", "-" and " " lines, from two lines above its first change (a patch opens
+// with context lines, so its first n lines are often all context), hunk
+// headers skipped.
+func diffHead(p string, n int) []string {
+	var all []string
+	first := -1
 	for _, l := range strings.Split(p, "\n") {
-		if strings.HasPrefix(l, "+") && strings.TrimSpace(l[1:]) != "" {
-			out = append(out, clip(strings.TrimRight(l[1:], "\r"), 80))
-			if len(out) == 4 {
-				break
-			}
+		if l == "" || strings.HasPrefix(l, "@@") || strings.HasPrefix(l, `\`) {
+			continue
+		}
+		if first < 0 && l[0] != ' ' {
+			first = len(all)
+		}
+		all = append(all, l[:1]+codeLine(l[1:]))
+		if first >= 0 && len(all) >= first+n {
+			break
 		}
 	}
-	return out
+	if first < 0 {
+		return nil // context only: nothing changed to show
+	}
+	start := max(0, first-2)
+	return all[start:min(len(all), start+n)]
+}
+
+var hunkRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@`)
+
+// excerpt is the window of the rebuilt file the page paints: codeLines lines
+// starting a little above the first line the patch added (or its first hunk),
+// the line number of the first, and which of them the patch added.
+func excerpt(content []byte, p string) (code []string, at int, added []int) {
+	var adds []int // 1-based line numbers, in the new file, of added lines
+	first, n := 0, 0
+	for _, l := range strings.Split(p, "\n") {
+		if m := hunkRe.FindStringSubmatch(l); m != nil {
+			n, _ = strconv.Atoi(m[1])
+			if first == 0 {
+				first = max(n, 1)
+			}
+			continue
+		}
+		switch {
+		case n == 0 || l == "" || strings.HasPrefix(l, `\`):
+		case l[0] == '+':
+			adds = append(adds, n)
+			n++
+		case l[0] == ' ':
+			n++
+		}
+	}
+	lines := strings.Split(string(content), "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) == 0 {
+		return nil, 0, nil
+	}
+	if len(adds) > 0 {
+		first = adds[0]
+	}
+	at = max(1, min(first-3, len(lines)-codeLines+1))
+	for i := at; i <= len(lines) && i < at+codeLines; i++ {
+		code = append(code, codeLine(lines[i-1]))
+	}
+	for _, a := range adds {
+		if a >= at && a < at+len(code) {
+			added = append(added, a-at)
+		}
+	}
+	return code, at, added
 }
 
 func clip(s string, n int) string {

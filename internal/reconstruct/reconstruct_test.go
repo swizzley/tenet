@@ -73,6 +73,50 @@ func TestFullHistoryRebuildsHeadExactly(t *testing.T) {
 	if sum.HeadFiles != headFiles || sum.HeadExact != headFiles-1 || sum.HeadUnknown != 1 {
 		t.Fatalf("head: %d files, %d exact, %d unknown; want %d, %d, 1 (the binary)", sum.HeadFiles, sum.HeadExact, sum.HeadUnknown, headFiles, headFiles-1)
 	}
+	// The code the page paints is the rebuilt file itself: each line equals git's
+	// content of that file at that commit, at that line number.
+	sha, painted, withAdds := "", 0, 0
+	for _, e := range rec.ev {
+		if e.T == "commit" {
+			sha = e.SHA
+		}
+		if e.T != "file" || len(e.Code) == 0 {
+			continue
+		}
+		want := strings.Split(strings.ReplaceAll(g.repo.Git("show", sha+":"+e.Path), "\t", "  "), "\n")
+		for i, l := range e.Code {
+			if n := e.At - 1 + i; n >= len(want) || l != want[n] {
+				t.Fatalf("%s@%s line %d painted %q, git has %q", e.Path, sha[:8], e.At+i, l, want[min(n, len(want)-1)])
+			}
+		}
+		for _, a := range e.Added {
+			if a < 0 || a >= len(e.Code) {
+				t.Fatalf("%s: added index %d outside %d lines", e.Path, a, len(e.Code))
+			}
+		}
+		painted++
+		if len(e.Added) > 0 {
+			withAdds++
+		}
+	}
+	// Each inverted commit that changed text shows the start of a patch. (The
+	// generated history has commits that change no file; those show none.)
+	withDiff := 0
+	for _, e := range rec.of("invert") {
+		if len(e.Diff) > 0 {
+			withDiff++
+			changed := false
+			for _, l := range e.Diff {
+				changed = changed || l[0] == '+' || l[0] == '-'
+			}
+			if !changed || !strings.Contains("+- ", e.Diff[0][:1]) || e.Path == "" {
+				t.Fatalf("invert %d: diff %q for %q shows no change", e.I, e.Diff, e.Path)
+			}
+		}
+	}
+	if painted == 0 || withAdds == 0 || withDiff < len(rec.of("invert"))/2 {
+		t.Fatalf("painted %d files (%d with added lines); %d of %d inverted commits show a diff", painted, withAdds, withDiff, len(rec.of("invert")))
+	}
 	modeOnly := 0
 	for _, e := range rec.of("file") {
 		if e.Status == "unknown" && e.Path != "logo.bin" {
@@ -91,6 +135,25 @@ func TestFullHistoryRebuildsHeadExactly(t *testing.T) {
 	}
 	t.Logf("%d commits, %d file versions: %d exact, %d unknown; head %d/%d exact",
 		sum.Commits, sum.FileVersions, sum.Exact, sum.Unknown, sum.HeadExact, sum.HeadFiles)
+}
+
+// A history longer than the commit list's pages (100 a page) walks to the root
+// across three of them, past the old 200-commit default; a smaller max stops
+// at exactly that many commits.
+func TestWalkPagesPastTwoHundredCommits(t *testing.T) {
+	g := newRig(t, 230, 16)
+	firstParents := len(strings.Fields(g.repo.Git("rev-list", "--first-parent", "main")))
+	if firstParents <= 200 {
+		t.Fatalf("the test history has %d first-parent commits; want more than 200", firstParents)
+	}
+	sum, err := g.runner.Run(context.Background(), "o", "r", 1000, func(Event) {})
+	if err != nil || !sum.RootReached || sum.Commits != firstParents || sum.HeadMissing != 0 || sum.Mismatch != 0 {
+		t.Fatalf("%+v %v; want all %d commits to the root", sum, err, firstParents)
+	}
+	sum, err = g.runner.Run(context.Background(), "o", "r", 210, func(Event) {})
+	if err != nil || sum.RootReached || sum.Commits != 210 {
+		t.Fatalf("%+v %v; want exactly 210 commits, root not reached", sum, err)
+	}
 }
 
 // The events follow the pincer: meta, the inverted walk newest first, the

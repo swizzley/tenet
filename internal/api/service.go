@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -28,7 +29,8 @@ type Collector interface {
 type Service struct {
 	Store     *store.Store
 	Collector Collector
-	Narrator  Narrator
+	Narrator  Narrator // nil without an Anthropic key: the narrative runs in the browser only
+	Browser   BrowserModel
 	TTL       time.Duration
 
 	flight singleflight.Group
@@ -120,7 +122,16 @@ type NarrativeResponse struct {
 	Cached    bool              `json:"cached"`
 }
 
+// ErrNoServerNarrator: no Anthropic key is configured.
+var ErrNoServerNarrator = errors.New("no anthropic_api_key is configured; the page writes the narrative in the browser")
+
+// ErrDataChanged: the period's data changed between the prompt and the check.
+var ErrDataChanged = errors.New("the period's data changed since the prompt was built")
+
 func (s *Service) Narrative(ctx context.Context, p Period) (NarrativeResponse, error) {
+	if s.Narrator == nil {
+		return NarrativeResponse{}, ErrNoServerNarrator
+	}
 	s.narrMu.Lock()
 	if c, ok := s.narrCache[p.key()]; ok && time.Since(c.at) < s.TTL {
 		s.narrMu.Unlock()
@@ -129,17 +140,15 @@ func (s *Service) Narrative(ctx context.Context, p Period) (NarrativeResponse, e
 	}
 	s.narrMu.Unlock()
 	v, err, _ := s.flight.Do("narrative|"+p.key(), func() (any, error) {
-		d, err := s.Load(ctx, p)
+		payload, src, err := s.payload(ctx, p, false)
 		if err != nil {
 			return NarrativeResponse{}, err
 		}
-		in := insight.Compute(p.Repo(), d.Records, p.Since, p.Until, "commits", d.Truncated)
-		payload := narrate.Payload(in, d.Records)
 		n, err := s.Narrator.Narrate(ctx, payload)
 		if err != nil {
 			return NarrativeResponse{}, err
 		}
-		out := NarrativeResponse{Narrative: n, Data: payload, Source: d.Source}
+		out := NarrativeResponse{Narrative: n, Data: payload, Source: src}
 		s.narrMu.Lock()
 		if s.narrCache == nil {
 			s.narrCache = map[string]cachedNarrative{}
@@ -157,4 +166,66 @@ func (s *Service) Narrative(ctx context.Context, p Period) (NarrativeResponse, e
 		return NarrativeResponse{}, err
 	}
 	return v.(NarrativeResponse), nil
+}
+
+// BrowserModel is the model the page runs over WebGPU.
+type BrowserModel struct {
+	ID           string `json:"id"`
+	Revision     string `json:"revision"`
+	DType        string `json:"dtype"`
+	MaxNewTokens int    `json:"max_new_tokens"`
+}
+
+// PromptResponse is what the page needs to write the narrative in the browser.
+type PromptResponse struct {
+	narrate.Prompt
+	Model  BrowserModel   `json:"model"`
+	Data   map[string]any `json:"data"`
+	Source string         `json:"source"`
+}
+
+// payload is the document a narrative reads: the full one for Claude, the
+// trimmed one for the small browser model.
+func (s *Service) payload(ctx context.Context, p Period, browser bool) (map[string]any, string, error) {
+	d, err := s.Load(ctx, p)
+	if err != nil {
+		return nil, "", err
+	}
+	in := insight.Compute(p.Repo(), d.Records, p.Since, p.Until, "commits", d.Truncated)
+	if browser {
+		return narrate.BrowserPayload(in, d.Records), d.Source, nil
+	}
+	return narrate.Payload(in, d.Records), d.Source, nil
+}
+
+// NarrativePrompt builds the browser model's prompt over the period's data.
+func (s *Service) NarrativePrompt(ctx context.Context, p Period) (PromptResponse, error) {
+	payload, src, err := s.payload(ctx, p, true)
+	if err != nil {
+		return PromptResponse{}, err
+	}
+	return PromptResponse{Prompt: narrate.BrowserPrompt(payload), Model: s.Browser, Data: payload, Source: src}, nil
+}
+
+// VerifyNarrative checks a browser model's raw output against the period's data,
+// rebuilt here: the page sends only text, never the numbers it is checked against.
+// It returns *narrate.UnsupportedError when the answer fails the check.
+func (s *Service) VerifyNarrative(ctx context.Context, p Period, digest, output string, attempt int) (NarrativeResponse, error) {
+	payload, src, err := s.payload(ctx, p, true)
+	if err != nil {
+		return NarrativeResponse{}, err
+	}
+	if narrate.Digest(payload) != digest {
+		return NarrativeResponse{}, ErrDataChanged
+	}
+	n, err := narrate.Extract(output)
+	if err != nil {
+		return NarrativeResponse{}, &narrate.UnsupportedError{Problems: []string{err.Error()}, Rejected: n}
+	}
+	n.Model, n.Attempts = "browser:"+s.Browser.ID, attempt
+	if probs := narrate.Validate(n, payload); len(probs) > 0 {
+		return NarrativeResponse{}, &narrate.UnsupportedError{Problems: probs, Rejected: n}
+	}
+	n.Validated = true
+	return NarrativeResponse{Narrative: n, Data: payload, Source: src}, nil
 }

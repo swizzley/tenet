@@ -26,7 +26,7 @@ import (
 )
 
 func main() {
-	cfgPath := flag.String("config", "config.json", "settings file; GITHUB_TOKEN and ANTHROPIC_API_KEY in the environment override its credentials")
+	cfgPath := flag.String("config", "config.json", "settings file; GITHUB_TOKEN and ANTHROPIC_API_KEY (optional) in the environment override its credentials")
 	flag.Parse()
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if err := run(*cfgPath, log); err != nil {
@@ -56,8 +56,15 @@ func run(cfgPath string, log *slog.Logger) error {
 	svc := &api.Service{
 		Store:     db,
 		Collector: &collect.Collector{GH: gh, Sink: sink, MaxCommits: cfg.MaxPeriodCommits},
-		Narrator:  narrate.New(cfg.AnthropicAPIKey, cfg.AnthropicModel),
-		TTL:       time.Duration(cfg.CacheTTLSeconds) * time.Second,
+		Browser: api.BrowserModel{ID: cfg.BrowserModel, Revision: cfg.BrowserModelRevision,
+			DType: "q4f16", MaxNewTokens: cfg.BrowserMaxNewTokens},
+		TTL: time.Duration(cfg.CacheTTLSeconds) * time.Second,
+	}
+	if cfg.AnthropicAPIKey != "" {
+		svc.Narrator = narrate.New(cfg.AnthropicAPIKey, cfg.AnthropicModel)
+		log.Info("narrative", "server", cfg.AnthropicModel, "browser", cfg.BrowserModel)
+	} else {
+		log.Info("narrative", "server", "off (no anthropic_api_key)", "browser", cfg.BrowserModel)
 	}
 	recon := &reconstruct.Manager{
 		Runner:  &reconstruct.Runner{GH: gh, Cache: db, Chunk: gh.Core.Chunk, BufferCap: cfg.BufferCap},

@@ -1,13 +1,15 @@
-// Package narrate asks Claude for a short narrative over an insight: what is
-// interesting or unusual, a root-cause hypothesis where the signal supports one, a
-// confidence score, and an evidence chain.
+// Package narrate writes a short narrative over an insight: what is interesting
+// or unusual, a root-cause hypothesis where the signal supports one, a confidence
+// score, and an evidence chain. Claude writes it on the server when a key is set
+// (Narrator); a small model writes it in the viewer's browser otherwise
+// (browser.go).
 //
-// The evidence chain is checked, not trusted. Each item names a metric by its path
-// in the exact JSON the model was given ("contributors[0].commit_share") and the
-// value it read there. Validate resolves every path and compares the value. A
-// narrative that cites a number absent from the data goes back to the model once
-// with the problems listed, and is refused if it fails again. So a narrative this
-// service returns cites only numbers that are in the source data.
+// The narrative is checked, not trusted. Each evidence item names a metric by its
+// path in the exact JSON the model was given ("contributors[0].commit_share") and
+// the value there; Validate resolves every path and compares the value. Every
+// number in the prose must be one of the data's numbers too. A narrative that
+// fails goes back to the model once with the problems listed, and is refused if
+// it fails again.
 package narrate
 
 import (
@@ -21,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/anthropics/anthropic-sdk-go/v2"
 	"github.com/anthropics/anthropic-sdk-go/v2/option"
@@ -127,22 +130,43 @@ func Payload(in insight.Insight, recs []collect.Record) map[string]any {
 	var m map[string]any
 	json.Unmarshal(b, &m)
 	m["contributors_total"] = len(in.Contributors)
-	if in.PeakWeek != nil {
-		heads := []string{}
-		end := in.PeakWeek.Start.AddDate(0, 0, 7)
-		for _, r := range recs {
-			d := r.Date.UTC()
-			if !d.Before(in.PeakWeek.Start) && d.Before(end) && r.Headline != "" {
-				heads = append(heads, r.Headline)
-			}
-		}
-		slices.Sort(heads)
-		heads = slices.Compact(heads)
-		m["peak_week_headlines_untrusted"] = heads[:min(25, len(heads))]
+	// The ratios a narrative reaches for, so they are in the data it is checked
+	// against: a model that computes its own (a live one wrote 40.7% for 39.3%)
+	// is refused.
+	if in.TotalCommits > 0 {
+		m["mean_lines_per_commit"] = round(float64(in.TotalLines)/float64(in.TotalCommits), 1)
 	}
-	// Round-trip once more, so the document the evidence is checked against is
-	// exactly the JSON the model reads (numbers as float64, nothing Go-typed).
-	b, _ = json.Marshal(m)
+	if pw, ok := m["peak_week"].(map[string]any); ok && in.PeakWeek != nil {
+		pw["commit_share"] = round(float64(in.PeakWeek.Commits)/float64(max(in.TotalCommits, 1)), 4)
+		pw["lines_share"] = round(float64(in.PeakWeek.LinesChanged)/float64(max(in.TotalLines, 1)), 4)
+		m["peak_week_headlines_untrusted"] = peakHeadlines(in, recs, 25)
+	}
+	return roundTrip(m)
+}
+
+func round(v float64, places int) float64 {
+	p := math.Pow(10, float64(places))
+	return math.Round(v*p) / p
+}
+
+func peakHeadlines(in insight.Insight, recs []collect.Record, n int) []string {
+	heads := []string{}
+	end := in.PeakWeek.Start.AddDate(0, 0, 7)
+	for _, r := range recs {
+		d := r.Date.UTC()
+		if !d.Before(in.PeakWeek.Start) && d.Before(end) && r.Headline != "" {
+			heads = append(heads, r.Headline)
+		}
+	}
+	slices.Sort(heads)
+	heads = slices.Compact(heads)
+	return heads[:min(n, len(heads))]
+}
+
+// roundTrip makes the document the evidence is checked against exactly the JSON
+// the model reads (numbers as float64, nothing Go-typed).
+func roundTrip(m map[string]any) map[string]any {
+	b, _ := json.Marshal(m)
 	var out map[string]any
 	json.Unmarshal(b, &out)
 	return out
@@ -159,7 +183,7 @@ func (n *Narrator) Narrate(ctx context.Context, payload map[string]any) (Narrati
 		MaxTokens: 16000,
 		System:    []anthropic.BetaTextBlockParam{{Text: system}},
 		Messages: []anthropic.BetaMessageParam{
-			anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock("Metrics JSON:\n" + string(doc))),
+			anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock(userMessage(doc))),
 		},
 		OutputConfig: anthropic.BetaOutputConfigParam{
 			Effort: anthropic.BetaOutputConfigEffortHigh,
@@ -201,9 +225,7 @@ func (n *Narrator) Narrate(ctx context.Context, payload map[string]any) (Narrati
 			}
 		}
 		params.Messages = append(params.Messages, resp.ToParam(),
-			anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock(
-				"Your answer failed the evidence check:\n- "+strings.Join(problems, "\n- ")+
-					"\nAnswer again. Cite only paths that exist in the metrics JSON, with the exact numbers found there.")))
+			anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock(RetryMessage(problems))))
 	}
 	return Narrative{}, &UnsupportedError{Problems: problems, Rejected: last}
 }
@@ -247,7 +269,80 @@ func Validate(nv Narrative, payload map[string]any) []string {
 			p = append(p, fmt.Sprintf("evidence %q says %v, the data holds %v", e.Metric, e.Value, got))
 		}
 	}
+	// A number in the prose must be in the data too, as written or rounded
+	// (0.1128 may read 0.11 or 11.3%), so no text shown carries an unchecked number.
+	known := docNumbers(payload)
+	prose := [][2]string{{"summary", nv.Summary}, {"hypothesis", nv.Hypothesis}}
+	for i, e := range nv.Evidence {
+		prose = append(prose, [2]string{fmt.Sprintf("evidence %d claim", i+1), e.Claim})
+	}
+	for i, c := range nv.Caveats {
+		prose = append(prose, [2]string{fmt.Sprintf("caveat %d", i+1), c})
+	}
+	for _, f := range prose {
+		name, text := f[0], f[1]
+		// A number written as a symbol ("⁴", "½") would slip past the numerals
+		// check below (a live run wrote some, 2026-10-30), so it is refused.
+		if i := strings.IndexFunc(text, func(r rune) bool { return unicode.IsNumber(r) && (r < '0' || r > '9') }); i >= 0 {
+			p = append(p, fmt.Sprintf("the %s writes a number as a symbol (%q); numbers go in numerals", name, []rune(text[i:])[0]))
+		}
+		for _, m := range numRe.FindAllStringSubmatch(text, -1) {
+			if !numberKnown(m[1], m[2], m[3] == "%", known) {
+				p = append(p, fmt.Sprintf("the %s cites %s%s%s, which is not in the data", name, m[1], m[2], m[3]))
+			}
+		}
+	}
 	return p
+}
+
+// numRe finds a number written in text: digits with optional thousands commas,
+// decimals and a percent sign, never part of a word ("top1_commit_share").
+var numRe = regexp.MustCompile(`(?:^|[^\w.])(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?(%?)`)
+
+// docNumbers is every number in the document: its values, and the numbers
+// written inside its strings (the dates, a version in a headline).
+func docNumbers(doc any) []float64 {
+	var out []float64
+	switch v := doc.(type) {
+	case float64:
+		out = append(out, v)
+	case string:
+		for _, m := range numRe.FindAllStringSubmatch(v, -1) {
+			if f, err := strconv.ParseFloat(strings.ReplaceAll(m[1], ",", "")+m[2], 64); err == nil {
+				out = append(out, f)
+			}
+		}
+	case map[string]any:
+		for _, x := range v {
+			out = append(out, docNumbers(x)...)
+		}
+	case []any:
+		for _, x := range v {
+			out = append(out, docNumbers(x)...)
+		}
+	}
+	return out
+}
+
+// numberKnown reports whether a number as written (whole part, ".decimals",
+// percent) is a document number rounded to the places written. A percentage
+// must be 100 times one: "0.3926%" for a share of 0.3926 is wrong (written live).
+func numberKnown(whole, frac string, pct bool, known []float64) bool {
+	n, err := strconv.ParseFloat(strings.ReplaceAll(whole, ",", "")+frac, 64)
+	if err != nil {
+		return false
+	}
+	places := max(0, len(frac)-1)
+	tol := 0.5*math.Pow(10, -float64(places)) + 1e-9
+	for _, v := range known {
+		if pct {
+			v *= 100
+		}
+		if math.Abs(n-v) <= tol {
+			return true
+		}
+	}
+	return false
 }
 
 // near allows only the rounding a model makes when it copies a number.

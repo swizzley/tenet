@@ -22,26 +22,54 @@ func writeCfg(t *testing.T, body string) string {
 	return p
 }
 
-func TestMissingBothFailsLoudlyNamingBoth(t *testing.T) {
-	_, err := Load(filepath.Join(t.TempDir(), "config.json"), env(nil))
-	if err == nil {
-		t.Fatal("started with no credentials")
-	}
-	for _, want := range []string{"github_token", "GITHUB_TOKEN", "anthropic_api_key", "ANTHROPIC_API_KEY"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error %q does not name %s", err, want)
+func TestMissingGitHubTokenFailsLoudlyNamingBothPlaces(t *testing.T) {
+	for _, body := range []string{"", `{"anthropic_api_key":"` + anSecret + `"}`} {
+		p := filepath.Join(t.TempDir(), "config.json")
+		if body != "" {
+			p = writeCfg(t, body)
+		}
+		_, err := Load(p, env(nil))
+		if err == nil {
+			t.Fatal("started with no GitHub token")
+		}
+		for _, want := range []string{"github_token", "GITHUB_TOKEN"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not name %s", err, want)
+			}
+		}
+		if strings.Contains(err.Error(), anSecret) {
+			t.Fatal("error printed a credential")
 		}
 	}
 }
 
-func TestMissingOneNamesOnlyThatOne(t *testing.T) {
-	p := writeCfg(t, `{"github_token":"`+ghSecret+`"}`)
-	_, err := Load(p, env(nil))
-	if err == nil || !strings.Contains(err.Error(), "anthropic_api_key") || strings.Contains(err.Error(), "github_token") {
-		t.Fatalf("err = %v", err)
+// Without an Anthropic key the service starts; the narrative runs in the browser.
+func TestAnthropicKeyIsOptional(t *testing.T) {
+	c, err := Load(writeCfg(t, `{"github_token":"`+ghSecret+`"}`), env(nil))
+	if err != nil || c.AnthropicAPIKey != "" {
+		t.Fatalf("%+v %v", c, err)
 	}
-	if strings.Contains(err.Error(), ghSecret) {
-		t.Fatal("error printed a credential")
+	if c.BrowserModel != "onnx-community/VibeThinker-1.5B-ONNX" || len(c.BrowserModelRevision) != 40 || c.BrowserMaxNewTokens != 4096 {
+		t.Fatalf("browser model defaults %+v", c)
+	}
+}
+
+// A browser model must be pinned to a commit, so every viewer runs the same weights.
+func TestBrowserModelMustBePinned(t *testing.T) {
+	base := `"github_token":"a"`
+	for _, extra := range []string{
+		`"browser_model":"x/y"`, // a model without its revision
+		`"browser_model":"x/y","browser_model_revision":"main"`,
+		`"browser_model":"https://evil.example/x","browser_model_revision":"7295deafb5bc8cb447c007a9d246f64e9fb13cc8"`,
+		`"browser_max_new_tokens":40000`,
+	} {
+		if _, err := Load(writeCfg(t, `{`+base+`,`+extra+`}`), env(nil)); err == nil {
+			t.Errorf("accepted %s", extra)
+		}
+	}
+	c, err := Load(writeCfg(t, `{`+base+`,"browser_model":"o/m","browser_model_revision":"0123456789abcdef0123456789abcdef01234567"}`), env(nil))
+	if err != nil || c.BrowserModel != "o/m" {
+		t.Fatalf("%+v %v", c, err)
 	}
 }
 
@@ -82,9 +110,9 @@ func TestEachCredentialFromEitherSource(t *testing.T) {
 	if err != nil || c.GitHubToken != ghSecret || c.AnthropicAPIKey != anSecret {
 		t.Fatalf("%+v %v", c, err)
 	}
-	// Only the GitHub token, from the environment: the Anthropic key is missing and named.
-	_, err = Load(filepath.Join(t.TempDir(), "absent.json"), env(map[string]string{EnvGitHubToken: ghSecret}))
-	if err == nil || !strings.Contains(err.Error(), "ANTHROPIC_API_KEY") || strings.Contains(err.Error(), "GITHUB_TOKEN") {
+	// Only the Anthropic key, from the environment: the GitHub token is missing and named.
+	_, err = Load(filepath.Join(t.TempDir(), "absent.json"), env(map[string]string{EnvAnthropicKey: anSecret}))
+	if err == nil || !strings.Contains(err.Error(), "GITHUB_TOKEN") || strings.Contains(err.Error(), "ANTHROPIC_API_KEY") {
 		t.Fatalf("err = %v", err)
 	}
 }

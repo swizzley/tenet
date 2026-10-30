@@ -67,6 +67,7 @@ type env struct {
 	url  string
 	logs *bytes.Buffer
 	sink *dbuf.Writer[collect.Record]
+	svc  *Service
 }
 
 type syncBuf struct {
@@ -104,7 +105,8 @@ func newEnv(t *testing.T) *env {
 	gh := github.New(github.Options{BaseURL: ghHTTP.URL, Token: ghToken, Logger: log})
 	srv := &Server{
 		Svc: &Service{Store: db, Collector: &collect.Collector{GH: gh, Sink: sink, MaxCommits: 10_000},
-			Narrator: narrate.New(llmKey, "claude-opus-5-5", option.WithBaseURL(llmHTTP.URL), option.WithMaxRetries(0)), TTL: time.Minute},
+			Narrator: narrate.New(llmKey, "claude-opus-5-5", option.WithBaseURL(llmHTTP.URL), option.WithMaxRetries(0)),
+			Browser:  BrowserModel{ID: "o/tiny-ONNX", Revision: strings.Repeat("a", 40), DType: "q4f16", MaxNewTokens: 64}, TTL: time.Minute},
 		Recon: &reconstruct.Manager{Runner: &reconstruct.Runner{GH: gh, Cache: db, Chunk: gh.Core.Chunk, BufferCap: 25},
 			MaxLive: 1, Keep: time.Minute, Timeout: time.Minute},
 		GH: gh, Sink: sink, Static: web.FS(), Log: log,
@@ -113,7 +115,24 @@ func newEnv(t *testing.T) *env {
 	}
 	hs := httptest.NewServer(srv.Handler())
 	t.Cleanup(hs.Close)
-	return &env{t, repo, ghSrv, llm, hs.URL, &logs.Buffer, sink}
+	return &env{t, repo, ghSrv, llm, hs.URL, &logs.Buffer, sink, srv.Svc}
+}
+
+func (e *env) post(path string, body any, out any) *http.Response {
+	e.t.Helper()
+	b, _ := json.Marshal(body)
+	r, err := http.Post(e.url+path, "application/json", bytes.NewReader(b))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer r.Body.Close()
+	rb, _ := io.ReadAll(r.Body)
+	if out != nil {
+		if err := json.Unmarshal(rb, out); err != nil {
+			e.t.Fatalf("%s: %v: %s", path, err, rb)
+		}
+	}
+	return r
 }
 
 func (e *env) get(path string, out any) *http.Response {
@@ -312,6 +331,85 @@ func TestNarrativeWithFabricatedNumbersIsWithheld(t *testing.T) {
 	}
 }
 
+// The browser path end to end: the page fetches the prompt, its model writes
+// reasoning then JSON, and the server checks that JSON against data it rebuilds
+// itself. A fabricated answer gets a 422 with the message for the retry.
+func TestBrowserNarrativeIsCheckedAgainstServerData(t *testing.T) {
+	e := newEnv(t)
+	var pr PromptResponse
+	if r := e.get("/api/v1/repos/o/r/insights/narrative/prompt?"+period, &pr); r.StatusCode != 200 {
+		t.Fatalf("prompt %d", r.StatusCode)
+	}
+	if pr.Model.ID != "o/tiny-ONNX" || len(pr.Digest) != 64 || !strings.Contains(pr.User, `"total_commits"`) {
+		t.Fatalf("%+v", pr.Model)
+	}
+	total, _ := narrate.Resolve(pr.Data, "total_commits")
+	share, _ := narrate.Resolve(pr.Data, "contributors[0].commit_share")
+	verify := "/api/v1/repos/o/r/insights/narrative/verify?" + period
+
+	var bad struct {
+		Error struct {
+			Code    string `json:"code"`
+			Details struct {
+				Problems []string `json:"problems"`
+				Retry    string   `json:"retry_prompt"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	// The answer as the page's worker writes it (narrate.Template's lines).
+	answer := func(total float64) string {
+		return fmt.Sprintf("<think>\nthinking...\n</think>\n\nSUMMARY: Ann carried the period.\n"+
+			"EVIDENCE: total_commits = %v | all commits\nEVIDENCE: contributors[0].commit_share = %v | the top share\n"+
+			"HYPOTHESIS: Ann is the main maintainer.\nCONFIDENCE: 0.6\nCAVEAT: main branch only\n", total, share)
+	}
+	if r := e.post(verify, map[string]any{"digest": pr.Digest, "output": answer(total + 7), "attempt": 1}, &bad); r.StatusCode != 422 ||
+		bad.Error.Code != "narrative_unsupported" || len(bad.Error.Details.Problems) != 1 || !strings.Contains(bad.Error.Details.Retry, "total_commits") {
+		t.Fatalf("fabricated: %d %+v", r.StatusCode, bad.Error)
+	}
+
+	var got NarrativeResponse
+	out := answer(total)
+	if r := e.post(verify, map[string]any{"digest": pr.Digest, "output": out, "attempt": 2}, &got); r.StatusCode != 200 {
+		t.Fatalf("good: %d", r.StatusCode)
+	}
+	if !got.Narrative.Validated || got.Narrative.Model != "browser:o/tiny-ONNX" || got.Narrative.Attempts != 2 {
+		t.Fatalf("%+v", got.Narrative)
+	}
+
+	// Another period's digest, or a malformed body, is refused.
+	if r := e.post(verify, map[string]any{"digest": strings.Repeat("0", 64), "output": out, "attempt": 1}, nil); r.StatusCode != 409 {
+		t.Fatalf("stale digest: %d", r.StatusCode)
+	}
+	if r := e.post(verify, map[string]any{"digest": pr.Digest, "output": out, "attempt": 1, "numbers": 1}, nil); r.StatusCode != 400 {
+		t.Fatalf("unknown field: %d", r.StatusCode)
+	}
+	if e.llm.calls != 0 {
+		t.Fatal("the browser path called the server's LLM")
+	}
+}
+
+// Without an Anthropic key the server narrative answers 501 and points to the page.
+func TestServerNarrativeOffWithoutKey(t *testing.T) {
+	e := newEnv(t)
+	e.svc.Narrator = nil
+	var body struct {
+		Error apiError `json:"error"`
+	}
+	if r := e.get("/api/v1/repos/o/r/insights/narrative?"+period, &body); r.StatusCode != 501 || body.Error.Code != "narrative_in_browser" {
+		t.Fatalf("%d %+v", r.StatusCode, body.Error)
+	}
+	var st struct {
+		Narrative struct {
+			Server  bool         `json:"server"`
+			Browser BrowserModel `json:"browser"`
+		} `json:"narrative"`
+	}
+	e.get("/api/v1/status", &st)
+	if st.Narrative.Server || st.Narrative.Browser.ID != "o/tiny-ONNX" {
+		t.Fatalf("%+v", st.Narrative)
+	}
+}
+
 // The API query triggers the reconstruction; the WebSocket streams it to the end.
 func TestReconstructionOverWebSocket(t *testing.T) {
 	e := newEnv(t)
@@ -365,6 +463,61 @@ func TestReconstructionOverWebSocket(t *testing.T) {
 	var again reconstruct.Event
 	if err := wsjson.Read(ctx, c2, &again); err != nil || again.T != "done" {
 		t.Fatalf("resume read %+v %v", again, err)
+	}
+	// A rebuilt file opens from the session, byte-equal to git's; the binary
+	// says it is unproven; a path never built is a 404.
+	file := strings.TrimSuffix(start["events"], "/events") + "/file?path="
+	var f struct {
+		Known   bool   `json:"known"`
+		Content string `json:"content"`
+	}
+	if r := e.get(file+"README.md", &f); r.StatusCode != 200 || !f.Known || f.Content != e.repo.Git("show", "main:README.md") {
+		t.Fatalf("README.md: %d known=%v, %d bytes against git's %d", r.StatusCode, f.Known, len(f.Content), len(e.repo.Git("show", "main:README.md")))
+	}
+	f = struct {
+		Known   bool   `json:"known"`
+		Content string `json:"content"`
+	}{}
+	if r := e.get(file+"logo.bin", &f); r.StatusCode != 200 || f.Known || f.Content != "" {
+		t.Fatalf("logo.bin: %d %+v", r.StatusCode, f)
+	}
+	if r := e.get(file+"nope.go", nil); r.StatusCode != 404 {
+		t.Fatalf("unknown path: %d", r.StatusCode)
+	}
+}
+
+// While a run is going, its files do not open: 409, not a 404 that would read
+// as "never built".
+func TestFileWaitsForTheRun(t *testing.T) {
+	e := newEnv(t)
+	release := make(chan struct{})
+	e.gh.Tamper = func(string, []map[string]any) { <-release } // holds every diff
+	var start map[string]string
+	resp, err := http.Post(e.url+"/api/v1/reconstructions", "application/json", strings.NewReader(`{"repo":"o/r"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	json.NewDecoder(resp.Body).Decode(&start)
+	resp.Body.Close()
+	file := strings.TrimSuffix(start["events"], "/events") + "/file?path=README.md"
+	if r := e.get(file, nil); r.StatusCode != 409 {
+		t.Fatalf("file during the run: %d, want 409", r.StatusCode)
+	}
+	close(release)
+	deadline := time.Now().Add(time.Minute)
+	for {
+		var st reconstruct.Status
+		e.get(start["status"], &st)
+		if st.State != "running" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the run never ended")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if r := e.get(file, nil); r.StatusCode != 200 {
+		t.Fatalf("file after the run: %d", r.StatusCode)
 	}
 }
 
@@ -431,7 +584,7 @@ func TestPageAndSecurityHeaders(t *testing.T) {
 	if !strings.Contains(h.Get("Content-Security-Policy"), "frame-ancestors 'none'") || h.Get("X-Content-Type-Options") != "nosniff" || h.Get("X-Frame-Options") != "DENY" {
 		t.Fatalf("headers %v", h)
 	}
-	for _, f := range []string{"/app.js", "/style.css"} {
+	for _, f := range []string{"/app.js", "/style.css", "/narrative.js", "/narrate-worker.js", "/favicon.svg"} {
 		if r := e.get(f, nil); r.StatusCode != 200 {
 			t.Errorf("%s: %d", f, r.StatusCode)
 		}

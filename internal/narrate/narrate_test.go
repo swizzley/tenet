@@ -40,6 +40,9 @@ func TestResolve(t *testing.T) {
 		"contributors[1].lines_changed": 3100,
 		"peak_week.commits":             2,
 		"contributors_total":            2,
+		"peak_week.commit_share":        0.6667, // 2 of 3
+		"peak_week.lines_share":         0.007,  // 22 of 3,122
+		"mean_lines_per_commit":         1040.7, // 3,122 / 3
 	}
 	for path, want := range cases {
 		got, err := Resolve(p, path)
@@ -73,6 +76,41 @@ func TestValidate(t *testing.T) {
 	}
 	if len(Validate(Narrative{Summary: "s", Confidence: 0.5, Evidence: good.Evidence[:1]}, p)) != 1 {
 		t.Fatal("one evidence item accepted")
+	}
+}
+
+// Numbers in the prose are checked too: as written, rounded, as a percentage, or
+// inside one of the document's strings (a date). A number from nowhere is named.
+func TestValidateProseNumbers(t *testing.T) {
+	p := samplePayload()
+	n := Narrative{Confidence: 0.4, Evidence: []Evidence{
+		{"ann leads with 66.7%", "contributors[0].commit_share", 0.6667},
+		{"bob's 3,100 lines", "contributors[1].lines_changed", 3100},
+	}, Summary: "Ann landed 2 of 3 commits (0.67 of them) in the week of 2026-03-02.", Caveats: []string{"release 1.0 is in a headline"}}
+	if probs := Validate(n, p); len(probs) != 0 {
+		t.Fatalf("true numbers refused: %v", probs)
+	}
+	n.Summary = "Ann landed 60.5% of 461 commits."
+	n.Hypothesis = "A 4-person team."
+	probs := Validate(n, p)
+	if len(probs) != 3 || !strings.Contains(strings.Join(probs, "|"), "the summary cites 60.5%") {
+		t.Fatalf("problems %v, want 3 (60.5%%, 461, 4)", probs)
+	}
+	// A number inside a word is no number: the summary may name top1_commit_share.
+	n.Summary, n.Hypothesis = "top1_commit_share is high.", ""
+	if probs := Validate(n, p); len(probs) != 0 {
+		t.Fatalf("%v", probs)
+	}
+	// A share written as a percentage must be scaled: 66.7% passes (above),
+	// 0.6667% does not (the small model wrote one live).
+	n.Summary = "Ann's share is 0.6667%."
+	if probs := Validate(n, p); len(probs) != 1 || !strings.Contains(probs[0], "0.6667%") {
+		t.Fatalf("%v", probs)
+	}
+	// A number as a symbol is refused, as the small model wrote one live.
+	n.Summary = "the highest share being ⁴."
+	if probs := Validate(n, p); len(probs) != 1 || !strings.Contains(probs[0], "as a symbol") {
+		t.Fatalf("%v", probs)
 	}
 }
 

@@ -25,8 +25,18 @@ type Session struct {
 	events  []Event
 	done    bool
 	summary *Summary
+	files   map[string]File // the rebuilt files, once the run is done
 	err     string
 	changed chan struct{}
+}
+
+// File returns one rebuilt file. ok is false while the run is going, or for a
+// path the run never built.
+func (s *Session) File(path string) (f File, done, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, ok = s.files[path]
+	return f, s.done, ok
 }
 
 func (s *Session) emit(e Event) {
@@ -37,11 +47,12 @@ func (s *Session) emit(e Event) {
 	s.changed = make(chan struct{})
 }
 
-func (s *Session) finish(sum *Summary, err error) {
+func (s *Session) finish(sum *Summary, files map[string]File, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.done = true
 	s.summary = sum
+	s.files = files
 	if err != nil {
 		s.err = err.Error()
 		s.events = append(s.events, Event{T: "error", Msg: s.err})
@@ -120,8 +131,8 @@ func (m *Manager) Start(owner, name string, maxCommits int) (*Session, error) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), m.Timeout)
 		defer cancel()
-		sum, err := m.Runner.Run(ctx, owner, name, maxCommits, s.emit)
-		s.finish(sum, err)
+		sum, files, err := m.Runner.RunFiles(ctx, owner, name, maxCommits, s.emit)
+		s.finish(sum, files, err)
 		if m.Log != nil {
 			m.Log.Info("reconstruction finished", "id", s.ID, "repo", s.Repo, "err", err)
 		}

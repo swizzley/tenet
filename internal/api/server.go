@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -44,9 +45,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/status", s.status)
 	mux.HandleFunc("GET /api/v1/repos/{owner}/{repo}/insights/contributors", s.contributors)
 	mux.HandleFunc("GET /api/v1/repos/{owner}/{repo}/insights/narrative", s.narrative)
+	mux.HandleFunc("GET /api/v1/repos/{owner}/{repo}/insights/narrative/prompt", s.narrativePrompt)
+	mux.HandleFunc("POST /api/v1/repos/{owner}/{repo}/insights/narrative/verify", s.verifyNarrative)
 	mux.HandleFunc("POST /api/v1/reconstructions", s.startReconstruction)
 	mux.HandleFunc("GET /api/v1/reconstructions/{id}", s.reconstructionStatus)
 	mux.HandleFunc("GET /api/v1/reconstructions/{id}/events", s.reconstructionEvents)
+	mux.HandleFunc("GET /api/v1/reconstructions/{id}/file", s.reconstructionFile)
 	mux.Handle("GET /", http.FileServerFS(s.Static))
 	return s.wrap(mux)
 }
@@ -58,10 +62,17 @@ type apiError struct {
 	Details any    `json:"details,omitempty"`
 }
 
+// writeJSON encodes before it writes the status, so a value that fails to encode
+// (a NaN) becomes a 500 with a body, never a status with an empty body.
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		status = 500
+		b, _ = json.Marshal(map[string]apiError{"error": {Code: "internal", Message: "the response failed to encode"}})
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	w.Write(append(b, '\n'))
 }
 
 func fail(w http.ResponseWriter, status int, code, msg string, details any) {
@@ -74,6 +85,10 @@ func (s *Server) upstream(w http.ResponseWriter, r *http.Request, err error) {
 	var se *github.StatusError
 	var ue *narrate.UnsupportedError
 	switch {
+	case errors.Is(err, ErrNoServerNarrator):
+		fail(w, 501, "narrative_in_browser", "no anthropic_api_key is configured, so the server writes no narrative. "+
+			"The page writes it in the browser: GET .../insights/narrative/prompt gives the model's input, "+
+			"POST .../insights/narrative/verify checks its answer against the data", nil)
 	case errors.Is(err, github.ErrNotFound):
 		fail(w, 404, "repo_not_found", "unknown repository: GitHub answered 404 (private repositories are out of scope)", nil)
 	case errors.Is(err, github.ErrEmptyRepo):
@@ -199,6 +214,59 @@ func (s *Server) narrative(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
+func (s *Server) narrativePrompt(w http.ResponseWriter, r *http.Request) {
+	p, err := s.period(r)
+	if err != nil {
+		fail(w, 400, "bad_request", err.Error(), nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+	out, err := s.Svc.NarrativePrompt(ctx, p)
+	if err != nil {
+		s.upstream(w, r, err)
+		return
+	}
+	writeJSON(w, 200, out)
+}
+
+// verifyNarrative checks a browser model's raw output. A failed check is the
+// client's answer at fault, so it is a 422, with the problems and the message
+// that asks the model to try again.
+func (s *Server) verifyNarrative(w http.ResponseWriter, r *http.Request) {
+	p, err := s.period(r)
+	if err != nil {
+		fail(w, 400, "bad_request", err.Error(), nil)
+		return
+	}
+	var req struct {
+		Digest  string `json:"digest"`
+		Output  string `json:"output"`
+		Attempt int    `json:"attempt"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 512<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil || len(req.Digest) != 64 || req.Output == "" || req.Attempt < 1 || req.Attempt > 10 {
+		fail(w, 400, "bad_request", `body must be JSON like {"digest":"<from the prompt>","output":"<the model's text>","attempt":1}, at most 512 KB`, nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+	out, err := s.Svc.VerifyNarrative(ctx, p, req.Digest, req.Output, req.Attempt)
+	var ue *narrate.UnsupportedError
+	switch {
+	case errors.As(err, &ue):
+		fail(w, 422, "narrative_unsupported", "the answer failed the check against the data", map[string]any{
+			"problems": ue.Problems, "rejected": ue.Rejected, "retry_prompt": narrate.RetryMessage(ue.Problems)})
+	case errors.Is(err, ErrDataChanged):
+		fail(w, 409, "data_changed", "the period's data changed since the prompt was built; fetch the prompt again", nil)
+	case err != nil:
+		s.upstream(w, r, err)
+	default:
+		writeJSON(w, 200, out)
+	}
+}
+
 func (s *Server) startReconstruction(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Repo       string `json:"repo"`
@@ -216,7 +284,7 @@ func (s *Server) startReconstruction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.MaxCommits == 0 {
-		req.MaxCommits = min(200, s.MaxReconstruct)
+		req.MaxCommits = s.MaxReconstruct // to the root, up to the configured cap
 	}
 	if req.MaxCommits < 1 || req.MaxCommits > s.MaxReconstruct {
 		fail(w, 400, "bad_request", fmt.Sprintf("max_commits must be 1 to %d", s.MaxReconstruct), nil)
@@ -281,11 +349,52 @@ func (s *Server) reconstructionEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// maxFileView is the most of one rebuilt file the file endpoint returns.
+const maxFileView = 1 << 20
+
+// reconstructionFile returns one file as the run rebuilt it, once the run is done.
+func (s *Server) reconstructionFile(w http.ResponseWriter, r *http.Request) {
+	sess, ok := s.Recon.Get(r.PathValue("id"))
+	if !ok {
+		fail(w, 404, "not_found", "unknown reconstruction id", nil)
+		return
+	}
+	path := r.URL.Query().Get("path")
+	if path == "" || len(path) > 1024 {
+		fail(w, 400, "bad_request", "path must name a file, at most 1024 characters", nil)
+		return
+	}
+	f, done, ok := sess.File(path)
+	switch {
+	case !done:
+		fail(w, 409, "running", "the files open when the reconstruction is done", nil)
+		return
+	case !ok:
+		fail(w, 404, "not_found", "the reconstruction built no file at that path", nil)
+		return
+	}
+	out := map[string]any{"path": path, "known": f.Known, "bytes": len(f.Content)}
+	if f.Known {
+		c := f.Content[:min(len(f.Content), maxFileView)]
+		out["truncated"] = len(c) < len(f.Content)
+		for i := 0; i < 3 && !utf8.Valid(c); i++ { // a cut may split the last character
+			c = c[:len(c)-1]
+		}
+		if utf8.Valid(c) {
+			out["content"] = string(c)
+		} else {
+			out["binary"] = true
+		}
+	}
+	writeJSON(w, 200, out)
+}
+
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"github_core":    s.GH.Core.Snapshot(),
 		"github_graphql": s.GH.GraphQL.Snapshot(),
 		"writer":         s.Sink.Stats(),
+		"narrative":      map[string]any{"server": s.Svc.Narrator != nil, "browser": s.Svc.Browser},
 	})
 }
 
@@ -297,8 +406,12 @@ type statusWriter struct {
 func (s *statusWriter) WriteHeader(c int)           { s.code = c; s.ResponseWriter.WriteHeader(c) }
 func (s *statusWriter) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
-const csp = "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; " +
-	"img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+// The browser model: transformers.js and ONNX Runtime's wasm come from jsdelivr
+// ('wasm-unsafe-eval' compiles the wasm), the weights from Hugging Face, whose
+// downloads redirect to its CDN under hf.co.
+const csp = "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; " +
+	"img-src 'self' data:; connect-src 'self' https://cdn.jsdelivr.net https://huggingface.co https://*.hf.co; " +
+	"worker-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
 
 // wrap adds security headers, panic recovery and one access-log line a request.
 // The log has the path and status, never headers or bodies.

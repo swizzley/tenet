@@ -18,8 +18,10 @@
     <input id="repo" name="repo" placeholder="owner/name  ·  e.g. rsc/quote" spellcheck="false" required
            pattern="\s*(https://github\.com/)?[A-Za-z0-9][A-Za-z0-9\-]{0,38}/[A-Za-z0-9._\-]{1,100}\s*">
     <button id="go" type="submit">Invert</button>
+    <button id="explain" type="button" title="A reasoning model on this GPU explains the last 30 days; the server checks every number">Explain</button>
   </form>
   <p id="msg" role="status" aria-live="polite"></p>
+  <div id="model" class="model" hidden><span id="model-label"></span><div class="track"><div id="model-bar"></div></div></div>
 </header>
 
 <aside class="hud-left" id="stats" hidden>
@@ -32,7 +34,9 @@
     <dt>unproven</dt><dd id="s-unknown" class="amber">0</dd>
     <dt>mismatch</dt><dd id="s-mismatch" class="red">0</dd>
   </dl>
-  <div class="legend"><i class="blue"></i>exact <i class="amber"></i>unproven <i class="red"></i>mismatch</div>
+  <div class="legend">layers <i class="added"></i>lines added <i class="removed"></i>removed</div>
+  <div class="legend">caps <i class="cap-exact"></i>exact <i class="amber"></i>unproven <i class="cap-mismatch"></i>mismatch</div>
+  <div class="legend hint">right-drag turns · wheel zooms · click opens a file</div>
 </aside>
 
 <aside class="hud-right" id="ticker" aria-label="events"></aside>
@@ -42,8 +46,42 @@
   <p id="sum-line"></p>
   <dl id="sum-grid"></dl>
   <p class="fine" id="sum-fine"></p>
+  <p class="fine">click to close</p>
+</section>
+
+<div id="tip" class="tip" hidden></div>
+
+<section class="file" id="file" hidden aria-label="file">
+  <header><h2 id="f-path"></h2><button id="f-close" type="button" aria-label="close">×</button></header>
+  <p class="fine" id="f-meta"></p>
+  <pre id="f-code"></pre>
+</section>
+
+<section class="narr" id="narr" hidden aria-label="narrative">
+  <header>
+    <h2>Narrative</h2>
+    <span id="n-model"></span>
+    <button id="n-stop" type="button" hidden>Stop</button>
+    <button id="n-close" type="button" aria-label="close">×</button>
+  </header>
+  <p id="n-data" class="fine"></p>
+  <p id="n-status" role="status" aria-live="polite"></p>
+  <div class="track"><div id="n-bar"></div></div>
+  <pre id="n-think" aria-label="the model's reasoning"></pre>
+  <div id="n-result" hidden>
+    <p id="n-summary"></p>
+    <h3>Hypothesis</h3>
+    <p id="n-hyp"></p>
+    <div class="conf"><span>confidence</span><div class="track"><div id="n-conf-bar"></div></div><span id="n-conf"></span></div>
+    <h3>Evidence <small>checked</small></h3>
+    <ol id="n-evidence"></ol>
+    <h3>Caveats</h3>
+    <ul id="n-caveats"></ul>
+    <p class="fine" id="n-fine"></p>
+  </div>
 </section>
 
 <script type="module" src="app.js"></script>
+<script type="module" src="narrative.js"></script>
 </body>
 </html>
