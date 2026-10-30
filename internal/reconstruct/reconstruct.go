@@ -79,6 +79,9 @@ type Summary struct {
 	Unknown      int    `json:"unknown"`
 	Mismatch     int    `json:"mismatch"`
 	Fetched      int    `json:"fetched"`        // exact versions whose blob was fetched, GitHub having sent no patch
+	Started      int    `json:"started"`        // files started from their blob in the tree before the walked window
+	Capped       int    `json:"capped"`         // commits whose file list GitHub cut at 3,000; the run re-reads the tree there
+	Resynced     int    `json:"resynced"`       // files set from a capped commit's tree, proven by their blob id
 	HeadFiles    int    `json:"head_files"`     // files in the head tree
 	HeadExact    int    `json:"head_exact"`     // ...rebuilt byte-exact
 	HeadUnknown  int    `json:"head_unknown"`   // ...present but unproven
@@ -98,6 +101,7 @@ type GitHub interface {
 	Commit(ctx context.Context, owner, name, sha string) (github.Commit, error)
 	Tree(ctx context.Context, owner, name, sha string) (github.Tree, error)
 	Blob(ctx context.Context, owner, name, sha string) ([]byte, error)
+	PathBlob(ctx context.Context, owner, name, ref, path string) (string, bool, error)
 }
 
 // Cache keeps commit details, which never change for a given id.
@@ -114,6 +118,7 @@ type Runner struct {
 	BufferCap int
 	MaxBytes  int // memory cap for rebuilt content, default 256 MiB
 	MaxCalls  int // GitHub calls one run may spend, default 1,500
+	FileCap   int // where GitHub cuts one commit's file list, default github.MaxCommitFiles
 }
 
 // Window bounds a run: at most Max commits, and none older than Since (zero:
@@ -121,6 +126,23 @@ type Runner struct {
 type Window struct {
 	Max   int
 	Since time.Time
+}
+
+// capped reports a commit whose file list GitHub cut short.
+func (r *Runner) capped(c github.Commit) bool {
+	limit := r.FileCap
+	if limit <= 0 {
+		limit = github.MaxCommitFiles
+	}
+	return len(c.Files) >= limit
+}
+
+// budget is the GitHub calls one run may spend.
+func (r *Runner) budget() int {
+	if r.MaxCalls > 0 {
+		return r.MaxCalls
+	}
+	return 1500
 }
 
 // The reasons a walk stops short of the root (Summary.Edge).
@@ -169,7 +191,101 @@ func (r *Runner) RunFiles(ctx context.Context, owner, name string, w Window, emi
 		}
 		return b, err
 	}
-	files, err := r.replay(ctx, stream, sum, emit, fetch)
+	// seed gives paths their content in the tree at one commit: at the commit
+	// just before the window, for files the window finds already there; at a
+	// commit whose file list GitHub cut, for every file. It runs in the forward
+	// replay, after the walk has ended, so it may read sum. The tree is listed
+	// once; the blobs are fetched by id in parallel chunks (from the cache when
+	// stored) and proven by their hash. A path whose blob in the tree is have(p)
+	// is left out; a path the tree lacks comes back gone; a file it cannot
+	// rebuild says why.
+	seed := func(at string, paths []string, have func(string) string) map[string]*file {
+		out := make(map[string]*file, len(paths))
+		if len(paths) == 0 {
+			return out
+		}
+		tree, err := r.GH.Tree(ctx, owner, name, at)
+		blobCalls++
+		type job struct{ path, sha string }
+		var jobs []job
+		for _, p := range paths {
+			sha, ok := tree.Blobs[p]
+			switch {
+			case err != nil:
+				out[p] = &file{why: "listing the tree at " + short(at) + " failed: " + err.Error()}
+			case !ok && tree.Truncated:
+				jobs = append(jobs, job{p, ""}) // GitHub cut the listing: look the path up alone
+			case !ok:
+				out[p] = &file{gone: true, why: "the tree at " + short(at) + " holds no such path"}
+			case sha == have(p):
+			default:
+				jobs = append(jobs, job{p, sha})
+			}
+		}
+		for i := 0; i < len(jobs); {
+			left := r.budget() - sum.APICalls - blobCalls
+			if left <= 0 {
+				for _, j := range jobs[i:] {
+					out[j.path] = &file{why: "the run's call budget was spent before its content at " + short(at) + " was fetched"}
+				}
+				break
+			}
+			n := min(r.Chunk(r.BufferCap), len(jobs)-i, left)
+			got, hit, looked, tried := make([]*file, n), make([]bool, n), make([]bool, n), make([]bool, n)
+			var cw sync.WaitGroup
+			for k := range n {
+				cw.Add(1)
+				go func() {
+					defer cw.Done()
+					j := jobs[i+k]
+					if j.sha == "" {
+						sha, found, err := r.GH.PathBlob(ctx, owner, name, at, j.path)
+						looked[k] = true
+						switch {
+						case err != nil:
+							got[k] = &file{why: "looking up its blob at " + short(at) + " failed: " + err.Error()}
+							return
+						case !found:
+							got[k] = &file{gone: true, why: "GitHub answers 404 for it at " + short(at)}
+							return
+						case sha == have(j.path):
+							return // unchanged: nothing to set
+						}
+						j.sha = sha
+					}
+					var b []byte
+					var err error
+					tried[k] = true
+					b, hit[k], err = r.blob(ctx, owner, name, j.sha)
+					switch {
+					case err != nil:
+						got[k] = &file{why: "fetching its content at " + short(at) + " failed: " + err.Error()}
+					case patch.BlobSHA(b) != j.sha:
+						got[k] = &file{why: "its blob at " + short(at) + " hashes to " + patch.BlobSHA(b)[:12] + ", not " + short(j.sha)}
+					default:
+						got[k] = &file{content: b, known: true}
+					}
+				}()
+			}
+			cw.Wait()
+			for k := range n {
+				if looked[k] {
+					blobCalls++
+				}
+				if tried[k] && hit[k] {
+					blobHits++
+				} else if tried[k] {
+					blobCalls++
+				}
+				if got[k] != nil { // nil: looked up, and unchanged
+					out[jobs[i+k].path] = got[k]
+				}
+			}
+			i += n
+		}
+		return out
+	}
+	files, err := r.replay(ctx, stream, sum, emit, fetch, seed)
 	wg.Wait()
 	sum.APICalls += blobCalls
 	sum.CacheHits += blobHits
@@ -195,10 +311,7 @@ func (r *Runner) RunFiles(ctx context.Context, owner, name string, w Window, emi
 // rate-limit-sized chunks (from the cache when it can), and publishes them on the
 // stream newest first.
 func (r *Runner) walk(ctx context.Context, owner, name string, w Window, stream chan<- github.Commit, sum *Summary, emit func(Event)) (string, error) {
-	budget := r.MaxCalls
-	if budget <= 0 {
-		budget = 1500
-	}
+	budget := r.budget()
 	repo := owner + "/" + name
 	info, err := r.GH.Repo(ctx, owner, name)
 	sum.APICalls++
@@ -357,10 +470,11 @@ type file struct {
 	content []byte
 	known   bool
 	why     string // when unknown: the reason
+	gone    bool   // from seed: the tree it read lacks the path
 }
 
 // replay receives the inverted stream, then plays it forward.
-func (r *Runner) replay(ctx context.Context, stream <-chan github.Commit, sum *Summary, emit func(Event), fetch func(string) ([]byte, error)) (map[string]*file, error) {
+func (r *Runner) replay(ctx context.Context, stream <-chan github.Commit, sum *Summary, emit func(Event), fetch func(string) ([]byte, error), seed func(at string, paths []string, have func(string) string) map[string]*file) (map[string]*file, error) {
 	var inverted []github.Commit
 	for c := range stream {
 		inverted = append(inverted, c)
@@ -384,36 +498,135 @@ func (r *Runner) replay(ctx context.Context, stream <-chan github.Commit, sum *S
 	if maxBytes == 0 {
 		maxBytes = 256 << 20
 	}
+	// A file the window's commits find already there starts from its content in
+	// a tree: the tree just before the window (the oldest walked commit's first
+	// parent), or, after a commit whose file list GitHub cut, that commit's tree.
+	// need[k] holds the paths first touched in segment k, the commits after the
+	// k-th such tree, so each segment's blobs are fetched together.
+	n := len(inverted)
+	var need [][]string
+	{
+		held, k := map[string]bool{}, 0
+		need = append(need, nil)
+		for i := n - 1; i >= 0; i-- {
+			for _, f := range inverted[i].Files {
+				p := f.Filename
+				if f.Status == "renamed" || f.Status == "copied" {
+					p = f.PreviousFilename
+				}
+				if f.Status != "added" && f.Status != "removed" && !held[p] {
+					need[k] = append(need[k], p)
+				}
+				held[p], held[f.Filename] = true, true
+			}
+			if r.capped(inverted[i]) {
+				need, k = append(need, nil), k+1
+			}
+		}
+	}
+	none := func(string) string { return "" }
+	starts := map[string]*file{}
+	if !sum.RootReached && n > 0 && len(inverted[n-1].Parents) > 0 {
+		starts = seed(inverted[n-1].Parents[0].SHA, need[0], none)
+	}
+	startAt := func(path string) *file {
+		if f, ok := starts[path]; ok {
+			if f.known {
+				sum.Started++
+			}
+			return f
+		}
+		if sum.RootReached {
+			return &file{why: "it is changed before any commit adds it"}
+		}
+		return &file{why: "its content predates the walked history"}
+	}
 	files := map[string]*file{}
 	total := 0
-	for i := len(inverted) - 1; i >= 0; i-- {
+	count := func(ev Event) {
+		switch ev.Status {
+		case "exact":
+			sum.Exact++
+			if ev.Fetched {
+				sum.Fetched++
+			}
+		case "unknown":
+			sum.Unknown++
+		case "mismatch":
+			sum.Mismatch++
+		}
+		if ev.Status != "deleted" {
+			sum.FileVersions++
+		}
+		emit(ev)
+	}
+	seg := 0
+	for i := n - 1; i >= 0; i-- {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		c := inverted[i]
-		emit(Event{T: "commit", I: len(inverted) - i, SHA: c.SHA, Author: author(c), Date: c.Commit.Author.Date.UTC().Format(time.RFC3339),
+		emit(Event{T: "commit", I: n - i, SHA: c.SHA, Author: author(c), Date: c.Commit.Author.Date.UTC().Format(time.RFC3339),
 			Headline: headline(c.Commit.Message), Files: len(c.Files)})
 		for _, f := range c.Files {
-			ev, delta := apply(files, f, sum.RootReached, fetch)
+			ev, delta := apply(files, f, startAt, fetch)
 			total += delta
 			if total > maxBytes {
 				return nil, fmt.Errorf("reconstruct: rebuilt content passed %d MiB; walk fewer commits", maxBytes>>20)
 			}
-			switch ev.Status {
-			case "exact":
-				sum.Exact++
-				if ev.Fetched {
-					sum.Fetched++
-				}
-			case "unknown":
-				sum.Unknown++
-			case "mismatch":
-				sum.Mismatch++
+			count(ev)
+		}
+		if !r.capped(c) {
+			continue
+		}
+		// GitHub listed only the first 3,000 of this commit's files, so its other
+		// changes never arrived as patches. Its tree is the truth: every file held
+		// is set to its blob there, and the paths first touched later start there.
+		sum.Capped++
+		seg++
+		paths := append([]string(nil), need[seg]...)
+		for p := range files {
+			paths = append(paths, p)
+		}
+		got := seed(c.SHA, paths, func(p string) string {
+			if f := files[p]; f != nil && f.known {
+				return patch.BlobSHA(f.content)
 			}
-			if ev.Status != "deleted" {
-				sum.FileVersions++
+			return ""
+		})
+		for _, p := range need[seg] {
+			if f, ok := got[p]; ok {
+				starts[p] = f
+				delete(got, p)
 			}
-			emit(ev)
+		}
+		for p, f := range got {
+			old := files[p]
+			if old == nil {
+				continue // a later first touch, already in starts
+			}
+			ev := Event{T: "file", Path: p, Op: "synced", I: n - i}
+			switch {
+			case f.gone:
+				delete(files, p)
+				total -= len(old.content)
+				ev.Status, ev.Why = "deleted", "removed by "+short(c.SHA)+", past the 3,000 files GitHub lists"
+			case f.known:
+				files[p] = f
+				total += len(f.content) - len(old.content)
+				ev.Status, ev.Fetched = "exact", true
+				ev.Why = "changed by " + short(c.SHA) + " past the 3,000 files GitHub lists; set from its tree, the blob matches"
+				ev.Lines = strings.Count(string(f.content), "\n")
+				sum.Resynced++
+			default:
+				files[p] = f
+				total -= len(old.content)
+				ev.Status, ev.Why = "unknown", f.why
+			}
+			count(ev)
+		}
+		if total > maxBytes {
+			return nil, fmt.Errorf("reconstruct: rebuilt content passed %d MiB; walk fewer commits", maxBytes>>20)
 		}
 	}
 	return files, nil
@@ -421,13 +634,14 @@ func (r *Runner) replay(ctx context.Context, stream <-chan github.Commit, sum *S
 
 // apply plays one file change and proves the result. It returns the event and the
 // change in rebuilt bytes.
-func apply(files map[string]*file, f github.File, fromRoot bool, fetch func(sha string) ([]byte, error)) (Event, int) {
+func apply(files map[string]*file, f github.File, start func(path string) *file, fetch func(sha string) ([]byte, error)) (Event, int) {
 	ev := Event{T: "file", Path: f.Filename, Op: f.Status, Adds: f.Additions, Dels: f.Deletions}
 	before := 0
 	if old := files[f.Filename]; old != nil {
 		before = len(old.content)
 	}
 	var base *file
+	seeded := false // base came from start: the file predates the walked window
 	switch f.Status {
 	case "removed":
 		delete(files, f.Filename)
@@ -436,6 +650,9 @@ func apply(files map[string]*file, f github.File, fromRoot bool, fetch func(sha 
 	case "renamed", "copied":
 		ev.From = f.PreviousFilename
 		base = files[f.PreviousFilename]
+		if base == nil {
+			base, seeded = start(f.PreviousFilename), true
+		}
 		if f.Status == "renamed" {
 			if base != nil {
 				before += len(base.content)
@@ -446,12 +663,16 @@ func apply(files map[string]*file, f github.File, fromRoot bool, fetch func(sha 
 		base = &file{known: true}
 	default: // "modified", "changed"
 		base = files[f.Filename]
+		if base == nil {
+			// Last changed before the walked window: start from its content there.
+			base, seeded = start(f.Filename), true
+		}
 	}
+	// A start that failed says why; any other unproven base passes on only that
+	// it is unproven.
 	why := "an earlier version of it is unproven"
-	if base == nil {
-		// A file older than the walked window: its earlier content was never streamed.
-		base = &file{known: fromRoot}
-		why = "its content predates the walked history"
+	if seeded {
+		why = base.why
 	}
 	out := &file{}
 	switch {

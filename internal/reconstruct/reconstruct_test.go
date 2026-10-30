@@ -2,6 +2,7 @@ package reconstruct
 
 import (
 	"context"
+	"fmt"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
@@ -173,6 +174,11 @@ func TestWalkStopsAtThePeriod(t *testing.T) {
 	if want == 0 || want > 40 {
 		t.Fatalf("the window holds %d first-parent commits; the test wants a few", want)
 	}
+	// Files changed in the window start from their content in the tree before
+	// it, so every version is proven (live: nova's cmdq.rs read "unproven").
+	if sum.Started == 0 || sum.Unknown != 0 || sum.Mismatch != 0 || sum.Exact != sum.FileVersions {
+		t.Fatalf("%+v; want every version in the window proven, started from the tree before it", sum)
+	}
 	walks := 0
 	for _, e := range rec.ev {
 		if e.T == "walk" {
@@ -253,51 +259,100 @@ func TestEventOrderIsAPincer(t *testing.T) {
 	}
 }
 
-// A window shorter than the history leaves the files older than the window
-// unproven. It never claims them exact.
-func TestPartialWindowNeverClaimsWhatItCannotProve(t *testing.T) {
+// GitHub lists at most 3,000 files of one commit (live: nova's merge of
+// v7.3-rc1, after which cmdq.rs read as a mismatch). The changes past the cut
+// never arrive as patches, so the run takes that commit's tree as the truth:
+// files held are set to it, and files first touched later start from it.
+// The fake cuts at 12 here; building 3,000 changes is slow. It runs again with
+// trees GitHub lists only in part (live: nova's 67,000-file trees, 29 files
+// unproven), where each missing path is looked up alone.
+func TestCappedCommitResyncsFromItsTree(t *testing.T) {
+	for _, cut := range []bool{false, true} {
+		t.Run(fmt.Sprintf("truncated=%v", cut), func(t *testing.T) { cappedCommit(t, cut) })
+	}
+}
+
+func cappedCommit(t *testing.T, truncated bool) {
 	g := newRig(t, 40, 8)
+	g.srv.MaxFiles, g.runner.FileCap = 12, 12
+	g.srv.TruncateTrees = truncated
+	readme := g.repo.Git("show", "main:README.md")
+	g.repo.Change(100, "keep and late", map[string]string{"keep.txt": "one\ntwo\nthree\n"})
+	big := map[string]string{"keep.txt": "one\nTWO\nthree\n", "README.md": readme + "cut from the list\n"}
+	for i := range 12 {
+		big[fmt.Sprintf("bulk/%02d.txt", i)] = fmt.Sprintf("bulk %d\n", i) // sorts before both, so both are cut
+	}
+	g.repo.Change(101, "a merge too big to list", big)
+	g.repo.Change(102, "keep again", map[string]string{"keep.txt": "one\nTWO\nthree\nfour\n"})
+	g.repo.Change(103, "readme again", map[string]string{"README.md": readme + "cut from the list\nand after\n"})
+
+	since := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Add(100 * time.Hour)
 	var rec recorder
-	sum, err := g.runner.Run(context.Background(), "o", "r", 6, rec.emit)
+	sum, files, err := g.runner.RunFiles(context.Background(), "o", "r", Window{Max: 1000, Since: since}, rec.emit)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sum.RootReached || sum.Commits != 6 || sum.Mismatch != 0 {
-		t.Fatalf("summary %+v", sum)
+	if sum.Commits != 4 || sum.Capped != 1 || sum.Resynced == 0 || sum.Unknown != 0 || sum.Mismatch != 0 {
+		t.Fatalf("%+v; want 4 commits, 1 capped, files resynced, all proven", sum)
 	}
-	if sum.Unknown == 0 || sum.HeadUnknown+sum.HeadMissing == 0 {
-		t.Fatalf("a 6-commit window over 40 commits proved everything? %+v", sum)
+	for _, p := range []string{"keep.txt", "README.md"} {
+		if f := files[p]; !f.Known || string(f.Content) != g.repo.Git("show", "main:"+p) {
+			t.Fatalf("%s: known %v, or its content differs from git's", p, f.Known)
+		}
 	}
-	// A file that existed before the window and is modified inside it has a past
-	// the walk never saw: it must be unknown, unless the window itself added it.
+	synced := 0
+	for _, e := range rec.of("file") {
+		if e.Op == "synced" && e.Status == "exact" {
+			synced++
+		}
+	}
+	if synced == 0 {
+		t.Fatal("no synced file events reached the page")
+	}
+	if looked := g.srv.ContentsCalls.Load(); truncated != (looked > 0) {
+		t.Fatalf("truncated %v, %d path lookups", truncated, looked)
+	}
+}
+
+// A window shorter than the history starts each file older than the window from
+// its blob in the tree just before it, proven by hash, so the window's versions
+// are proven too. A head file the window never touched is reported never built,
+// not claimed.
+func TestPartialWindowStartsFromTheTreeBeforeIt(t *testing.T) {
+	g := newRig(t, 40, 8)
+	var rec recorder
+	sum, files, err := g.runner.RunFiles(context.Background(), "o", "r", Window{Max: 6}, rec.emit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.RootReached || sum.Commits != 6 || sum.Mismatch != 0 || sum.Unknown != 0 || sum.Started == 0 {
+		t.Fatalf("summary %+v; want every version proven, files started before the window", sum)
+	}
+	if sum.HeadMissing == 0 || sum.HeadExact+sum.HeadMissing != sum.HeadFiles {
+		t.Fatalf("summary %+v; want the head files the window never touched reported never built", sum)
+	}
+	// Each file the window modified, having existed before it, equals git's.
 	oldest := rec.of("commit")[0].SHA
 	before := map[string]bool{}
 	for _, p := range strings.Fields(g.repo.Git("ls-tree", "-r", "--name-only", oldest+"^")) {
 		before[p] = true
 	}
-	added, seen := map[string]bool{}, map[string]bool{}
 	checked := 0
 	for _, e := range rec.of("file") {
-		if e.Op == "added" {
-			added[e.Path] = true
-		}
-		if e.Op == "modified" && before[e.Path] && !added[e.Path] {
+		if e.Op == "modified" && before[e.Path] {
 			checked++
-			// The reason matters: the strict patch and the blob check would also stop a
-			// wrong claim, but this file is unproven because its past was never
-			// streamed (first touch), and stays so because that version is unproven.
-			want := "an earlier version of it is unproven"
-			if !seen[e.Path] {
-				want = "its content predates the walked history"
-			}
-			seen[e.Path] = true
-			if e.Status != "unknown" || e.Why != want {
-				t.Fatalf("%s predates the window: reported %s (%s), want unknown (%s)", e.Path, e.Status, e.Why, want)
+			if e.Status != "exact" {
+				t.Fatalf("%s predates the window: reported %s (%s), want exact", e.Path, e.Status, e.Why)
 			}
 		}
 	}
 	if checked == 0 {
 		t.Fatal("the window modified no older file, so this test proved nothing")
+	}
+	for p, f := range files {
+		if f.Known && string(f.Content) != g.repo.Git("show", "main:"+p) {
+			t.Fatalf("%s: the rebuilt content differs from git's", p)
+		}
 	}
 }
 

@@ -74,18 +74,20 @@ The Claude path is the same check without the template: with a key, `GET .../nar
 3. **The stream.** The walker publishes the diffs newest-first on a channel, the way a WebSocket would deliver real-time diffs. The replayer reads that inverted stream to its end (the turnstile), then plays it forward from an empty tree.
 4. **Applying patches.** `internal/patch` applies every patch strictly. Every resulting file must hash to the blob id GitHub reports for it at that commit, and the final tree is checked against the head tree.
 5. **Changes with no patch.** GitHub sends no patch for a binary file or a very large diff. The run then fetches the blob by the id GitHub reports, proves it by its hash, and caches it in SQLite. The file's later versions build on it. Before this, one withheld patch (+2,929 −15 in tensorwire/mongoose) left every later version of that file unproven, and 10 binaries read as false mismatches. That run now proves 366 of 366 versions.
-6. **Unproven files.** A file the run cannot prove is reported as unknown, with the reason, never guessed. The reason travels to the file view. The causes left:
-   - a file older than the walked window;
+6. **Files older than the window.** A window that stops short of the root finds most files already there. Each starts from its blob in the tree at the commit just before the window, fetched by id and proven by its hash. The blobs are fetched together, in parallel chunks, at the turnstile. Before this, every version of such a file read "unproven" (live: nvidia/nova's `gsp/cmdq.rs` at 90 days).
+7. **Commits past GitHub's list.** GitHub lists at most 3,000 files of one commit. A merge that changed more (live: nova's merge of v7.3-rc1, `c63829528980`) sends no patch for the rest. The next patch to such a file then applied cleanly to stale bytes, and the hash check reported a mismatch. The run now treats a capped commit's tree as the truth. Each held file is set to its blob there, proven by hash. A file first touched later starts from that tree. The page shows such a change as a "synced" floor with no patch. GitHub also lists a very large tree only in part (nova's: 29 files read "unproven" for it); a path the listing left out is looked up alone (`GET .../contents/{path}?ref=`).
+8. **Unproven files.** A file the run cannot prove is reported as unknown, with the reason, never guessed. The reason travels to the file view. The causes left:
+   - the run's call budget spent before a file's starting content was fetched;
    - a blob over 20 MiB;
    - a failed fetch.
-7. **Viewing.** Events go to viewers over a WebSocket. A late or reconnecting viewer replays from any index.
-8. **The code, painted.** An inverted event carries the start of one file's patch. The page shows it mirrored and red, and un-writes it: the lines the commit added erase, the lines it removed come back. A forward file event carries up to 16 lines of the rebuilt file around the change, with the lines the patch added marked. The page paints them on a sheet (context fades in, added lines type themselves out), then folds the sheet onto the building's roof. A test checks that every painted line equals git's own content of that file at that commit and line number.
-9. **The night city** (three.js 0.186.1 with OrbitControls and an UnrealBloom pass, simplex-noise 4.0.3; the world is seeded by the repository's name, so a repository always grows the same city).
+9. **Viewing.** Events go to viewers over a WebSocket. A late or reconnecting viewer replays from any index.
+10. **The code, painted.** An inverted event carries the start of one file's patch. The page shows it mirrored and red, and un-writes it: the lines the commit added erase, the lines it removed come back. A forward file event carries up to 16 lines of the rebuilt file around the change, with the lines the patch added marked. The page paints them on a sheet (context fades in, added lines type themselves out), then folds the sheet onto the building's roof. A test checks that every painted line equals git's own content of that file at that commit and line number.
+11. **The night city** (three.js 0.186.1 with OrbitControls and an UnrealBloom pass, simplex-noise 4.0.3; the world is seeded by the repository's name, so a repository always grows the same city).
    - **Inverted:** the camera runs down an avenue at street level. Each commit raises a red neon arch with its headline mirrored; rain falls upward and the traffic runs backward.
    - **Forward:** each directory is a city block on a square spiral, 25 lots a block. Each file is a skyscraper: one band of floors per change, as tall as the lines it changed, its windows lit from magenta (lines removed) to cyan (lines added). Its roof carries a beacon for the file's proof: green exact, amber unproven, red mismatch. Billboards flash commit headlines, and flying cars circle on sky lanes.
    - **The viewer:** the camera holds still once the viewer moves it. Right-drag orbits, the wheel zooms, and middle-drag pans. Hovering a floor band names the commit that wrote it, with its lines added and removed.
    - **Clicks:** a roof opens the current copy (`GET .../file?path=`, once the run is done). A floor band opens that change's diff (`GET .../diff?sha=&path=`, from the stored commit details, with no GitHub call).
-10. **Length.** A run walks to the root, up to `max_reconstruct` commits (default 1,000), paging the commit list 100 at a time. A test walks a real 230-commit history across three pages.
+12. **Length.** A run walks back to the period's start, or to the root without one, up to `max_reconstruct` commits (default 1,000), paging the commit list 100 at a time. A test walks a real 230-commit history across three pages.
 
 ## 3. Decisions and trade-offs
 
@@ -179,7 +181,16 @@ The browser narrative's own live defects are listed with its measurements below.
   | google/uuid | 109 | 33 of 33 |
   | spf13/pflag | 233 | 91 of 91 |
 
-  With the period window (2026-10-30, 90 days): nvidia/nova walked 136 first-parent commits in 236 s, stopped at the `period` edge, made 501 GitHub calls, with 0 mismatches. rsc/quote shifted to the 90 days before its last commit: 6 commits, 5 calls, 1.3 s.
+  With the period window (2026-10-30, 90 days), nvidia/nova, 136 first-parent commits, stopped at the `period` edge:
+
+  | Build | Proven | Unproven | Mismatch | Calls | Time |
+  |---|---|---|---|---|---|
+  | window only | 838 of 3,307 | 2,469 | 0 | 501 | 236 s |
+  | + start before the window | 2,843 of 3,307 | 462 | 2 | 1,501 (budget) | 230 s |
+  | + capped commit resync, cold blobs | 3,269 of 3,312 | 43 | 0 | 518 | 134 s |
+  | + truncated-tree lookups, warm cache | 3,311 of 3,311 | 0 | 0 | 134 | 81 s |
+
+  rsc/quote shifted to the 90 days before its last commit: 6 commits, 5 calls, 1.3 s.
 
   A repeat google/uuid run made 5 GitHub calls instead of 114. spf13/pflag ran to its root past the old 200-commit limit: 233 commits, 589 file versions, all exact.
 

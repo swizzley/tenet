@@ -453,7 +453,7 @@ function forwardFile(e) {
   const line = new THREE.Mesh(box, new THREE.MeshBasicMaterial({ color: col }));
   line.scale.set(2.06, 0.05, 2.06);
   line.position.y = tw.top;
-  band.userData = { tower: tw, th, y: tw.top + th / 2, flash: 1, adds, dels, commit: commitNow, fetched: !!e.fetched, line };
+  band.userData = { tower: tw, th, y: tw.top + th / 2, flash: 1, adds, dels, commit: commitNow, fetched: !!e.fetched, synced: e.op === 'synced' ? e.why : '', line };
   line.userData = band.userData;
   tw.group.add(band, line);
   tw.layers.push(band);
@@ -926,7 +926,11 @@ function showPanel(title, meta) {
 }
 async function getJSON(url) {
   const r = await fetch(url);
-  const b = await r.json();
+  const b = await r.json().catch(() => ({}));
+  // Runs live in the server's memory: after a restart this city's run is gone.
+  if (r.status === 404 && b.error && b.error.code === 'not_found' && /reconstruction id/.test(b.error.message)) {
+    throw new Error('the server restarted since this run, so its files are gone; press INVERT to run it again');
+  }
   if (!r.ok) throw new Error(b.error ? b.error.message : r.statusText);
   return b;
 }
@@ -950,6 +954,12 @@ async function openFile(tw) {
 async function openDiff(tw, layer) {
   const c = layer.userData.commit;
   showPanel(`${tw.path} @ ${c.sha.slice(0, 8)}`, 'opening…');
+  if (layer.userData.synced) {
+    // GitHub's file list for this commit stops at 3,000, before this file.
+    $('f-meta').textContent = `${c.date} ${c.author} · ${c.headline}`;
+    $('f-code').textContent = `GitHub lists this commit's first 3,000 files only, and this one comes after them.\n${layer.userData.synced}.`;
+    return;
+  }
   try {
     const d = await getJSON(`/api/v1/reconstructions/${sessionId}/diff?sha=${c.sha}&path=${encodeURIComponent(tw.path)}`);
     $('f-meta').textContent = `${c.date} ${c.author} · ${d.headline} · ${d.status}${d.from ? ' from ' + d.from : ''} · +${d.additions} −${d.deletions}`;

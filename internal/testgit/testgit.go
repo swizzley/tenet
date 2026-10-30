@@ -57,6 +57,15 @@ func (r *Repo) Git(args ...string) string {
 	return string(out)
 }
 
+// Change writes files and commits them as commit n (dated n hours after
+// 2026-01-01).
+func (r *Repo) Change(n int, msg string, files map[string]string) {
+	for name, content := range files {
+		r.write(name, content)
+	}
+	r.commit(msg, n)
+}
+
 func (r *Repo) write(name, content string) {
 	p := filepath.Join(r.Dir, name)
 	os.MkdirAll(filepath.Dir(p), 0o755)
@@ -166,6 +175,14 @@ type Server struct {
 	MaxSeen      atomic.Int64
 	// Tamper, when set, may change a commit's files before they are served.
 	Tamper func(sha string, files []map[string]any)
+	// MaxFiles, when set, cuts a commit's file list there, as GitHub does at
+	// 3,000 (tests use a small cap: building 3,000 changes is slow).
+	MaxFiles int
+	// TruncateTrees, when set, lists half of each tree and marks it truncated,
+	// as GitHub does for a very large tree; ContentsCalls counts the per-path
+	// lookups that recover the rest.
+	TruncateTrees bool
+	ContentsCalls atomic.Int64
 
 	mu sync.Mutex
 }
@@ -225,7 +242,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		}
 		json.NewEncoder(w).Encode(out)
 	case strings.HasPrefix(p, "/commits/"):
-		json.NewEncoder(w).Encode(s.commit(strings.TrimPrefix(p, "/commits/")))
+		c := s.commit(strings.TrimPrefix(p, "/commits/"))
+		if fs, _ := c["files"].([]map[string]any); s.MaxFiles > 0 && len(fs) > s.MaxFiles {
+			c["files"] = fs[:s.MaxFiles]
+		}
+		json.NewEncoder(w).Encode(c)
 	case strings.HasPrefix(p, "/git/blobs/"):
 		s.BlobCalls.Add(1)
 		b := g("cat-file", "blob", strings.TrimPrefix(p, "/git/blobs/"))
@@ -237,7 +258,24 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			f := strings.Fields(meta)
 			tree = append(tree, map[string]string{"path": path, "type": f[1], "sha": f[2]})
 		}
+		if s.TruncateTrees {
+			json.NewEncoder(w).Encode(map[string]any{"tree": tree[:len(tree)/2], "truncated": true})
+			return
+		}
 		json.NewEncoder(w).Encode(map[string]any{"tree": tree, "truncated": false})
+	case strings.HasPrefix(p, "/contents/"):
+		s.ContentsCalls.Add(1)
+		path := strings.TrimPrefix(p, "/contents/")
+		meta, _, _ := strings.Cut(strings.TrimSpace(g("ls-tree", req.URL.Query().Get("ref"), "--", path)), "\t")
+		switch f := strings.Fields(meta); {
+		case len(f) < 3:
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"message":"Not Found"}`)
+		case f[1] == "tree":
+			fmt.Fprint(w, `[]`) // a directory: GitHub lists its entries
+		default:
+			json.NewEncoder(w).Encode(map[string]string{"type": "file", "path": path, "sha": f[2]})
+		}
 	default:
 		w.WriteHeader(http.StatusNotFound)
 		fmt.Fprint(w, `{"message":"Not Found"}`)

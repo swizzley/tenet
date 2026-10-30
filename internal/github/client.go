@@ -379,6 +379,11 @@ func (c *Client) ListCommits(ctx context.Context, owner, name string, o ListOpti
 // filesPerPage is how many files GitHub returns on one page of a commit.
 const filesPerPage = 300
 
+// MaxCommitFiles is where GitHub stops listing one commit's files; a commit
+// that changed more lists only these (live: nvidia/nova's merge of v7.3-rc1,
+// c63829528980, listed 3,000).
+const MaxCommitFiles = 3000
+
 // Commit returns one commit with its stats and per-file patches. A commit with more
 // than 300 files comes in pages; Commit reads them all (GitHub stops at 3,000).
 func (c *Client) Commit(ctx context.Context, owner, name, sha string) (Commit, error) {
@@ -446,6 +451,39 @@ func (c *Client) Tree(ctx context.Context, owner, name, sha string) (Tree, error
 	}
 	t.Truncated = raw.Truncated
 	return t, nil
+}
+
+// PathBlob returns the blob id of one file at a commit: the lookup for a path
+// a truncated tree left out (live: nvidia/nova's 67,000-file trees). found is
+// false when the commit holds no file there.
+func (c *Client) PathBlob(ctx context.Context, owner, name, ref, path string) (sha string, found bool, err error) {
+	if !shaRe.MatchString(ref) {
+		return "", false, fmt.Errorf("github: bad commit id %q", ref)
+	}
+	segs := strings.Split(path, "/")
+	for i, s := range segs {
+		segs[i] = url.PathEscape(s)
+	}
+	var raw json.RawMessage
+	_, err = c.getJSON(ctx, repoPath(owner, name)+"/contents/"+strings.Join(segs, "/"), url.Values{"ref": {ref}}, &raw)
+	if errors.Is(err, ErrNotFound) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	var f struct {
+		Type string `json:"type"`
+		SHA  string `json:"sha"`
+	}
+	// A directory comes back as a list, and fails to decode as one file.
+	if json.Unmarshal(raw, &f) != nil || f.Type != "file" {
+		return "", false, nil
+	}
+	if !shaRe.MatchString(f.SHA) {
+		return "", false, fmt.Errorf("github: %s at %s returned an invalid blob id", path, ref)
+	}
+	return f.SHA, true, nil
 }
 
 // Blob returns a file's content by its blob id. GitHub sends it base64-encoded;
